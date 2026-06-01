@@ -47,7 +47,6 @@ void main() {
     await client.identify(
       ' u1 ',
       traits: {'plan': 'pro'},
-      preferredChannel: WhisperrChannelType.email,
       channels: [WhisperrChannel.email('a@b.com', verified: true)],
     );
     await client.flush();
@@ -60,9 +59,30 @@ void main() {
     final body = jsonDecode(requests.first.body) as Map<String, dynamic>;
     expect(body['external_user_id'], 'u1');
     expect(body['traits'], {'plan': 'pro'});
-    expect(body['preferred_channel'], 'email');
+    expect(body.containsKey('preferred_channel'), isFalse);
     expect((body['channels'] as List).first, {'channel': 'email', 'address': 'a@b.com', 'verified': true});
     expect(client.currentUserId, 'u1');
+  });
+
+  test('email/phone shortcuts expand into opted-in channels', () async {
+    final requests = <http.Request>[];
+    final mock = MockClient((req) async {
+      requests.add(req);
+      return http.Response('{"user":{"id":"usr_1","external_id":"u1","created":true}}', 200);
+    });
+    final client = buildClient(mock);
+    addTearDown(client.close);
+    await client.start();
+
+    await client.identify('u1', email: 'ada@example.com', phone: '+15551234567');
+    await client.flush();
+
+    final body = jsonDecode(requests.first.body) as Map<String, dynamic>;
+    final channels = (body['channels'] as List).cast<Map<String, dynamic>>();
+    expect(channels, hasLength(2));
+    expect(channels[0], {'channel': 'email', 'address': 'ada@example.com'});
+    expect(channels[1], {'channel': 'sms', 'address': '+15551234567'});
+    expect(body.containsKey('preferred_channel'), isFalse);
   });
 
   test('track buffers events and flushes them as a single batch', () async {

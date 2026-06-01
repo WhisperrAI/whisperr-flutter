@@ -83,16 +83,24 @@ class WhisperrClient {
     if (_queue.isNotEmpty) unawaited(flush());
   }
 
-  /// Identifies the current user and persists their traits / contact channels.
+  /// Identifies the current user and persists their traits and contact channels.
   ///
   /// Sets [currentUserId] so subsequent [track] calls attribute to this user.
-  /// Enqueued durably and flushed in order; returns once buffered (call
-  /// [flush] to await delivery).
+  ///
+  /// Pass [email] / [phone] / [pushToken] for the common case; they expand into
+  /// opted-in channels. For consent or verification control (opt-out, verified
+  /// flags, multiple addresses) build [channels] explicitly. Whisperr decides
+  /// which channel to actually use, so there is no "preferred channel" to set.
+  ///
+  /// Enqueued durably and flushed in order; returns once buffered (call [flush]
+  /// to await delivery).
   Future<void> identify(
     String externalUserId, {
     Map<String, dynamic>? traits,
+    String? email,
+    String? phone,
+    String? pushToken,
     List<WhisperrChannel>? channels,
-    WhisperrChannelType? preferredChannel,
   }) async {
     _ensureUsable();
     final id = externalUserId.trim();
@@ -101,12 +109,16 @@ class WhisperrClient {
     }
     _currentUserId = id;
 
+    final resolved = <WhisperrChannel>[
+      if (email != null && email.trim().isNotEmpty) WhisperrChannel.email(email.trim()),
+      if (phone != null && phone.trim().isNotEmpty) WhisperrChannel.sms(phone.trim()),
+      if (pushToken != null && pushToken.trim().isNotEmpty) WhisperrChannel.push(pushToken.trim()),
+      ...?channels,
+    ];
+
     final body = <String, dynamic>{'external_user_id': id};
     if (traits != null && traits.isNotEmpty) body['traits'] = traits;
-    if (preferredChannel != null) body['preferred_channel'] = preferredChannel.wireValue;
-    if (channels != null && channels.isNotEmpty) {
-      body['channels'] = channels.map((c) => c.toJson()).toList();
-    }
+    if (resolved.isNotEmpty) body['channels'] = resolved.map((c) => c.toJson()).toList();
 
     await _enqueue(WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: body));
     unawaited(flush());

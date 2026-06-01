@@ -13,9 +13,8 @@ Future<void> main() async {
   // Identify the signed-in user once you know who they are.
   await Whisperr.instance.identify(
     'user_123',
-    traits: {'email': 'ada@example.com', 'plan': 'pro'},
-    channels: [WhisperrChannel.email('ada@example.com', verified: true)],
-    preferredChannel: WhisperrChannelType.email,
+    email: 'ada@example.com',
+    traits: {'name': 'Ada', 'plan': 'pro'},
   );
 
   runApp(const _ExampleApp());

@@ -23,16 +23,28 @@ await Whisperr.initialize(apiKey: 'wrk_xxx');
 
 ## Identify
 
-Set who the current user is. Idempotent and safe to call on every login. Traits are merged server-side; channels are how Whisperr can reach the user.
+Set who the current user is. Idempotent and safe to call on every login. Traits are merged server-side; channels are how Whisperr can reach the user (and whether it's allowed to).
 
 ```dart
+// Common case — email/phone/pushToken expand into opted-in channels:
 await Whisperr.instance.identify(
   'user_123',
-  traits: {'email': 'ada@example.com', 'name': 'Ada', 'plan': 'pro'},
-  channels: [WhisperrChannel.email('ada@example.com', verified: true)],
-  preferredChannel: WhisperrChannelType.email,
+  email: 'ada@example.com',
+  phone: '+15551234567',
+  traits: {'name': 'Ada', 'plan': 'pro'},
+);
+
+// Full control — consent and verification:
+await Whisperr.instance.identify(
+  'user_123',
+  channels: [
+    WhisperrChannel.email('ada@example.com', verified: true),
+    WhisperrChannel.sms('+15551234567', optedIn: false), // opted out of SMS
+  ],
 );
 ```
+
+> Whisperr decides which channel to actually use based on engagement — there's no "preferred channel" to set. Express an explicit user choice via `optedIn: false` on the channels they don't want.
 
 ## Track
 
