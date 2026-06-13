@@ -109,6 +109,11 @@ void main() {
     expect(events[0]['event_type'], 'opened_app');
     expect(events[0]['occurred_at'], '2026-05-31T12:00:00.000Z');
     expect(events[1]['properties'], {'amount': 42});
+    // Each event carries a unique idempotency key for server-side dedup.
+    final firstMessageId = events[0]['context'][r'$message_id'] as String;
+    final secondMessageId = events[1]['context'][r'$message_id'] as String;
+    expect(firstMessageId, isNotEmpty);
+    expect(firstMessageId, isNot(secondMessageId));
     expect(client.pendingCount, 0);
   });
 

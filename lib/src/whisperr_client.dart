@@ -145,15 +145,22 @@ class WhisperrClient {
       throw ArgumentError.value(eventType, 'eventType', 'must not be empty');
     }
 
+    // The op id doubles as the idempotency key: it's stable across retries
+    // (the queue is durable) so the server can dedup at-least-once redelivery.
+    final messageId = _nextId();
+    final mergedContext = <String, dynamic>{
+      if (context != null) ...context,
+      r'$message_id': messageId,
+    };
     final body = <String, dynamic>{
       'external_user_id': uid,
       'event_type': type,
       'occurred_at': _clock().toIso8601String(),
+      'context': mergedContext,
     };
     if (properties != null && properties.isNotEmpty) body['properties'] = properties;
-    if (context != null && context.isNotEmpty) body['context'] = context;
 
-    await _enqueue(WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.track, body: body));
+    await _enqueue(WhisperrQueueOp(id: messageId, kind: WhisperrOpKind.track, body: body));
 
     if (_queue.length >= _options.flushAt) unawaited(flush());
   }
