@@ -100,6 +100,7 @@ class WhisperrClient {
     String? email,
     String? phone,
     String? pushToken,
+    String? preferredChannel,
     List<WhisperrChannel>? channels,
   }) async {
     _ensureUsable();
@@ -110,14 +111,17 @@ class WhisperrClient {
     _currentUserId = id;
 
     final resolved = <WhisperrChannel>[
-      if (email != null && email.trim().isNotEmpty) WhisperrChannel.email(email.trim()),
-      if (phone != null && phone.trim().isNotEmpty) WhisperrChannel.sms(phone.trim()),
-      if (pushToken != null && pushToken.trim().isNotEmpty) WhisperrChannel.push(pushToken.trim()),
+      if (email != null && email.trim().isNotEmpty) WhisperrChannel.email(email.trim(), optedIn: true),
+      if (phone != null && phone.trim().isNotEmpty) WhisperrChannel.sms(phone.trim(), optedIn: true),
+      if (pushToken != null && pushToken.trim().isNotEmpty) WhisperrChannel.push(pushToken.trim(), optedIn: true),
       ...?channels,
     ];
 
     final body = <String, dynamic>{'external_user_id': id};
     if (traits != null && traits.isNotEmpty) body['traits'] = traits;
+    if (preferredChannel != null && preferredChannel.trim().isNotEmpty) {
+      body['preferred_channel'] = preferredChannel.trim();
+    }
     if (resolved.isNotEmpty) body['channels'] = resolved.map((c) => c.toJson()).toList();
 
     await _enqueue(WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: body));
@@ -156,9 +160,9 @@ class WhisperrClient {
       'external_user_id': uid,
       'event_type': type,
       'occurred_at': _clock().toIso8601String(),
+      'properties': properties ?? <String, dynamic>{},
       'context': mergedContext,
     };
-    if (properties != null && properties.isNotEmpty) body['properties'] = properties;
 
     await _enqueue(WhisperrQueueOp(id: messageId, kind: WhisperrOpKind.track, body: body));
 

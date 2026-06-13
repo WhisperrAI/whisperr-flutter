@@ -80,8 +80,8 @@ void main() {
     final body = jsonDecode(requests.first.body) as Map<String, dynamic>;
     final channels = (body['channels'] as List).cast<Map<String, dynamic>>();
     expect(channels, hasLength(2));
-    expect(channels[0], {'channel': 'email', 'address': 'ada@example.com'});
-    expect(channels[1], {'channel': 'sms', 'address': '+15551234567'});
+    expect(channels[0], {'channel': 'email', 'address': 'ada@example.com', 'opted_in': true});
+    expect(channels[1], {'channel': 'sms', 'address': '+15551234567', 'opted_in': true});
     expect(body.containsKey('preferred_channel'), isFalse);
   });
 
