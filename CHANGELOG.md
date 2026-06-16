@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- Truncate `occurred_at` to millisecond precision (RFC3339 `Z`), matching the spec and the other Whisperr SDKs. Dart's `DateTime.toIso8601String()` emits microseconds, which previously went out verbatim.
+- Validate `event_type` client-side: invalid names are dropped (surfaced via `onError`) instead of being sent, so one malformed event can't make the server reject an entire batch.
+
 ## 0.2.3
 
 - Sync the reported SDK version (`kWhisperrSdkVersion`) with the package version; it had drifted to `0.2.0`.

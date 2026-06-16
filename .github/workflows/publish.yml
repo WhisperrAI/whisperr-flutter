@@ -1,0 +1,28 @@
+name: Publish
+
+# Publishes to pub.dev when a version tag is pushed:
+#   git tag v0.2.4 && git push origin v0.2.4
+# Uses pub.dev automated publishing (OIDC) — no token. Configured on the package
+# admin page with the tag pattern `v{{version}}`, so the tag must match the
+# pubspec version (e.g. v0.2.4 ↔ version: 0.2.4).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  id-token: write # required for pub.dev OIDC authentication
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: dart pub publish --force

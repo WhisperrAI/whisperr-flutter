@@ -1,6 +1,6 @@
 name: whisperr
 description: Official Whisperr SDK for Flutter — identify users and track product events to power churn-prevention interventions.
-version: 0.2.3
+version: 0.2.4
 homepage: https://github.com/WhisperrAI/whisperr-flutter
 repository: https://github.com/WhisperrAI/whisperr-flutter
 issue_tracker: https://github.com/WhisperrAI/whisperr-flutter/issues
