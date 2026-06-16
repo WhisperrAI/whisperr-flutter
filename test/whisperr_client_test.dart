@@ -34,11 +34,13 @@ WhisperrClient buildClient(
 }
 
 void main() {
-  test('identify posts a normalized body to /v1/identify with auth header', () async {
+  test('identify posts a normalized body to /v1/identify with auth header',
+      () async {
     final requests = <http.Request>[];
     final mock = MockClient((req) async {
       requests.add(req);
-      return http.Response('{"user":{"id":"usr_1","external_id":"u1","created":true}}', 200);
+      return http.Response(
+          '{"user":{"id":"usr_1","external_id":"u1","created":true}}', 200);
     });
     final client = buildClient(mock);
     addTearDown(client.close);
@@ -60,7 +62,8 @@ void main() {
     expect(body['external_user_id'], 'u1');
     expect(body['traits'], {'plan': 'pro'});
     expect(body.containsKey('preferred_channel'), isFalse);
-    expect((body['channels'] as List).first, {'channel': 'email', 'address': 'a@b.com', 'verified': true});
+    expect((body['channels'] as List).first,
+        {'channel': 'email', 'address': 'a@b.com', 'verified': true});
     expect(client.currentUserId, 'u1');
   });
 
@@ -68,20 +71,24 @@ void main() {
     final requests = <http.Request>[];
     final mock = MockClient((req) async {
       requests.add(req);
-      return http.Response('{"user":{"id":"usr_1","external_id":"u1","created":true}}', 200);
+      return http.Response(
+          '{"user":{"id":"usr_1","external_id":"u1","created":true}}', 200);
     });
     final client = buildClient(mock);
     addTearDown(client.close);
     await client.start();
 
-    await client.identify('u1', email: 'ada@example.com', phone: '+15551234567');
+    await client.identify('u1',
+        email: 'ada@example.com', phone: '+15551234567');
     await client.flush();
 
     final body = jsonDecode(requests.first.body) as Map<String, dynamic>;
     final channels = (body['channels'] as List).cast<Map<String, dynamic>>();
     expect(channels, hasLength(2));
-    expect(channels[0], {'channel': 'email', 'address': 'ada@example.com', 'opted_in': true});
-    expect(channels[1], {'channel': 'sms', 'address': '+15551234567', 'opted_in': true});
+    expect(channels[0],
+        {'channel': 'email', 'address': 'ada@example.com', 'opted_in': true});
+    expect(channels[1],
+        {'channel': 'sms', 'address': '+15551234567', 'opted_in': true});
     expect(body.containsKey('preferred_channel'), isFalse);
   });
 
@@ -96,7 +103,8 @@ void main() {
     await client.start();
 
     await client.track('opened_app', userId: 'u1');
-    await client.track('checkout_completed', properties: {'amount': 42}, userId: 'u1');
+    await client.track('checkout_completed',
+        properties: {'amount': 42}, userId: 'u1');
     expect(client.pendingCount, 2);
 
     await client.flush();
@@ -126,7 +134,40 @@ void main() {
     expect(() => client.track('opened_app'), throwsStateError);
   });
 
-  test('a failed flush keeps the queue and persists it; a fresh client restores and delivers', () async {
+  test('invalid event_type is dropped before it can poison a batch', () async {
+    final requests = <http.Request>[];
+    final errors = <WhisperrError>[];
+    final mock = MockClient((req) async {
+      requests.add(req);
+      return http.Response('{"accepted":1,"rejected":0}', 202);
+    });
+    final client = buildClient(
+      mock,
+      options: WhisperrOptions(
+        flushOnLifecyclePause: false,
+        retryBaseDelay: const Duration(milliseconds: 1),
+        maxRetryDelay: const Duration(milliseconds: 5),
+        maxRetries: 2,
+        onError: errors.add,
+      ),
+    );
+    addTearDown(client.close);
+    await client.start();
+
+    await client.track('User Signed Up', userId: 'u1');
+    await client.track('checkout_completed', userId: 'u1');
+    await client.flush();
+
+    expect(errors.any((e) => e.type == 'dropped'), isTrue);
+    final body = jsonDecode(requests.single.body) as Map<String, dynamic>;
+    final events = body['events'] as List;
+    expect(events, hasLength(1));
+    expect(events.first['event_type'], 'checkout_completed');
+  });
+
+  test(
+      'a failed flush keeps the queue and persists it; a fresh client restores and delivers',
+      () async {
     final store = InMemoryPersistence();
     final requests = <http.Request>[];
     var online = false;
@@ -157,7 +198,8 @@ void main() {
 
   test('a permanent client error (400) drops the offending op', () async {
     final mock = MockClient((req) async {
-      return http.Response('{"error":{"code":"invalid_request","message":"bad"}}', 400);
+      return http.Response(
+          '{"error":{"code":"invalid_request","message":"bad"}}', 400);
     });
     final client = buildClient(mock);
     addTearDown(client.close);
@@ -171,7 +213,8 @@ void main() {
 
   test('an auth error pauses delivery and keeps the queue', () async {
     final mock = MockClient((req) async {
-      return http.Response('{"error":{"code":"invalid_api_key","message":"nope"}}', 401);
+      return http.Response(
+          '{"error":{"code":"invalid_api_key","message":"nope"}}', 401);
     });
     final client = buildClient(mock);
     addTearDown(client.close);
@@ -180,7 +223,8 @@ void main() {
     await client.track('opened_app', userId: 'u1');
     await client.flush();
 
-    expect(client.pendingCount, 1); // retained for a later flush once the key is fixed
+    expect(client.pendingCount,
+        1); // retained for a later flush once the key is fixed
   });
 
   test('reaching flushAt triggers an automatic flush', () async {
@@ -205,11 +249,14 @@ void main() {
     expect(client.pendingCount, 0);
   });
 
-  test('identify is delivered before subsequent tracks (ordered queue)', () async {
+  test('identify is delivered before subsequent tracks (ordered queue)',
+      () async {
     final paths = <String>[];
     final mock = MockClient((req) async {
       paths.add(req.url.path);
-      final ok = req.url.path.endsWith('identify') ? '{"user":{"id":"x","external_id":"u1","created":true}}' : '{"accepted":1,"rejected":0}';
+      final ok = req.url.path.endsWith('identify')
+          ? '{"user":{"id":"x","external_id":"u1","created":true}}'
+          : '{"accepted":1,"rejected":0}';
       return http.Response(ok, req.url.path.endsWith('identify') ? 200 : 202);
     });
     final client = buildClient(mock);

@@ -23,7 +23,7 @@ Future<Map<String, dynamic>> _loadSpec() async {
   return jsonDecode(res.body) as Map<String, dynamic>;
 }
 
-WhisperrClient _client(MockClient mock) {
+WhisperrClient _client(MockClient mock, {DateTime? clock}) {
   final api = WhisperrApiClient(
     httpClient: mock,
     baseUrl: 'https://api.test',
@@ -39,7 +39,7 @@ WhisperrClient _client(MockClient mock) {
       maxRetryDelay: Duration(milliseconds: 5),
       maxRetries: 2,
     ),
-    clock: () => DateTime.utc(2026, 5, 31, 12),
+    clock: () => clock ?? DateTime.utc(2026, 5, 31, 12),
     random: Random(7),
   );
 }
@@ -59,7 +59,8 @@ Future<void> _applyCase(WhisperrClient client, Map<String, dynamic> c) async {
     channels = (s['channels'] as List).map((raw) {
       final ch = raw as Map<String, dynamic>;
       return WhisperrChannel(
-        type: WhisperrChannelType.values.firstWhere((t) => t.wireValue == ch['type']),
+        type: WhisperrChannelType.values
+            .firstWhere((t) => t.wireValue == ch['type']),
         address: ch['address'] as String,
         optedIn: ch['optedIn'] as bool?,
         verified: ch['verified'] as bool?,
@@ -87,9 +88,13 @@ void main() {
       final requests = <http.Request>[];
       final mock = MockClient((req) async {
         requests.add(req);
-        return http.Response('{"user":{"id":"u","external_id":"u","created":true}}', 200);
+        return http.Response(
+            '{"user":{"id":"u","external_id":"u","created":true}}', 200);
       });
-      final client = _client(mock);
+      final clockIso =
+          (c['scenario'] as Map<String, dynamic>)['clockIso'] as String?;
+      final client = _client(mock,
+          clock: clockIso == null ? null : DateTime.parse(clockIso).toUtc());
       addTearDown(client.close);
       await client.start();
       await _applyCase(client, c);
@@ -108,10 +113,15 @@ void main() {
           expect(event[k], v, reason: '${c['name']}.$k');
         });
         for (final key in (c['contextMustContain'] as List? ?? [])) {
-          expect((event['context'] as Map)[key], isNotNull, reason: '${c['name']} context.$key');
+          expect((event['context'] as Map)[key], isNotNull,
+              reason: '${c['name']} context.$key');
         }
         if (c['occurredAtRfc3339Z'] == true) {
           expect(_rfc3339Z.hasMatch(event['occurred_at'] as String), isTrue);
+        }
+        if (c['expectedOccurredAt'] != null) {
+          expect(event['occurred_at'], c['expectedOccurredAt'],
+              reason: '${c['name']}.occurred_at');
         }
       } else {
         (c['expectedBody'] as Map<String, dynamic>? ?? {}).forEach((k, v) {

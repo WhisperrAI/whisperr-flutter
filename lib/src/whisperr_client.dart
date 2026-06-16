@@ -17,6 +17,8 @@ const String kWhisperrSdkVersion = '0.2.3';
 /// development backends.
 const String kWhisperrDefaultBaseUrl = 'https://api.whisperr.net';
 
+final _eventTypePattern = RegExp(r'^[a-z0-9]+(?:_[a-z0-9]+)*$');
+
 /// The Whisperr engine: an ordered, durable outbound queue that delivers
 /// identify and track calls to the runtime API with batching, retry, and
 /// offline persistence.
@@ -156,6 +158,11 @@ class WhisperrClient {
     if (type.isEmpty) {
       throw ArgumentError.value(eventType, 'eventType', 'must not be empty');
     }
+    if (!_eventTypePattern.hasMatch(type)) {
+      _emit('dropped', 'invalid event_type "$type"; expected snake_case');
+      _log('invalid event_type "$type"; event was not queued');
+      return;
+    }
 
     // The op id doubles as the idempotency key: it's stable across retries
     // (the queue is durable) so the server can dedup at-least-once redelivery.
@@ -167,7 +174,7 @@ class WhisperrClient {
     final body = <String, dynamic>{
       'external_user_id': uid,
       'event_type': type,
-      'occurred_at': _clock().toIso8601String(),
+      'occurred_at': _occurredAtIso(),
       'properties': properties ?? <String, dynamic>{},
       'context': mergedContext,
     };
@@ -312,6 +319,13 @@ class WhisperrClient {
 
   String _nextId() =>
       '${_clock().microsecondsSinceEpoch}-${_seq++}-${_random.nextInt(0x7fffffff)}';
+
+  String _occurredAtIso() {
+    final t = _clock().toUtc();
+    return DateTime.fromMillisecondsSinceEpoch(t.millisecondsSinceEpoch,
+            isUtc: true)
+        .toIso8601String();
+  }
 
   void _ensureUsable() {
     if (_closed) throw StateError('Whisperr client has been closed.');
