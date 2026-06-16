@@ -106,14 +106,18 @@ class WhisperrClient {
     _ensureUsable();
     final id = externalUserId.trim();
     if (id.isEmpty) {
-      throw ArgumentError.value(externalUserId, 'externalUserId', 'must not be empty');
+      throw ArgumentError.value(
+          externalUserId, 'externalUserId', 'must not be empty');
     }
     _currentUserId = id;
 
     final resolved = <WhisperrChannel>[
-      if (email != null && email.trim().isNotEmpty) WhisperrChannel.email(email.trim(), optedIn: true),
-      if (phone != null && phone.trim().isNotEmpty) WhisperrChannel.sms(phone.trim(), optedIn: true),
-      if (pushToken != null && pushToken.trim().isNotEmpty) WhisperrChannel.push(pushToken.trim(), optedIn: true),
+      if (email != null && email.trim().isNotEmpty)
+        WhisperrChannel.email(email.trim(), optedIn: true),
+      if (phone != null && phone.trim().isNotEmpty)
+        WhisperrChannel.sms(phone.trim(), optedIn: true),
+      if (pushToken != null && pushToken.trim().isNotEmpty)
+        WhisperrChannel.push(pushToken.trim(), optedIn: true),
       ...?channels,
     ];
 
@@ -122,9 +126,12 @@ class WhisperrClient {
     if (preferredChannel != null && preferredChannel.trim().isNotEmpty) {
       body['preferred_channel'] = preferredChannel.trim();
     }
-    if (resolved.isNotEmpty) body['channels'] = resolved.map((c) => c.toJson()).toList();
+    if (resolved.isNotEmpty) {
+      body['channels'] = resolved.map((c) => c.toJson()).toList();
+    }
 
-    await _enqueue(WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: body));
+    await _enqueue(WhisperrQueueOp(
+        id: _nextId(), kind: WhisperrOpKind.identify, body: body));
     unawaited(flush());
   }
 
@@ -142,7 +149,8 @@ class WhisperrClient {
     _ensureUsable();
     final uid = (userId ?? _currentUserId)?.trim();
     if (uid == null || uid.isEmpty) {
-      throw StateError('track() requires a user: call identify() first or pass userId.');
+      throw StateError(
+          'track() requires a user: call identify() first or pass userId.');
     }
     final type = eventType.trim();
     if (type.isEmpty) {
@@ -164,7 +172,8 @@ class WhisperrClient {
       'context': mergedContext,
     };
 
-    await _enqueue(WhisperrQueueOp(id: messageId, kind: WhisperrOpKind.track, body: body));
+    await _enqueue(
+        WhisperrQueueOp(id: messageId, kind: WhisperrOpKind.track, body: body));
 
     if (_queue.length >= _options.flushAt) unawaited(flush());
   }
@@ -212,28 +221,40 @@ class WhisperrClient {
             batch.add(op);
             if (batch.length >= _options.maxBatchSize) break;
           }
-          final result = await _api.trackBatch(batch.map((o) => o.body).toList());
+          final result =
+              await _api.trackBatch(batch.map((o) => o.body).toList());
           _queue.removeRange(0, batch.length);
           await _persist();
           if (result.rejected > 0) {
-            _log('batch delivered: ${result.accepted} accepted, ${result.rejected} rejected (dropped)');
+            _emit('dropped',
+                'batch delivered with ${result.rejected} rejected event(s)');
+            _log(
+                'batch delivered: ${result.accepted} accepted, ${result.rejected} rejected (dropped)');
           }
         }
         attempt = 0;
       } on WhisperrApiException catch (e) {
         if (e.isClientError) {
+          _emit('dropped', 'dropped op after permanent client error',
+              status: e.statusCode);
           _log('dropping op after permanent client error ($e)');
           _queue.removeAt(0);
           await _persist();
           continue;
         }
         if (e.isAuthError) {
+          _emit('auth', 'delivery paused - API key rejected',
+              status: e.statusCode);
           _log('auth error — pausing delivery, check your API key ($e)');
           return;
         }
         attempt++;
         if (attempt > _options.maxRetries) {
-          _log('transient failures exhausted retries; will retry on next flush ($e)');
+          _emit('retry_exhausted',
+              'delivery failed after retries; will retry on next flush',
+              status: e.statusCode);
+          _log(
+              'transient failures exhausted retries; will retry on next flush ($e)');
           return;
         }
         await Future<void>.delayed(_backoff(attempt));
@@ -246,7 +267,10 @@ class WhisperrClient {
     if (_queue.length > _options.maxQueueSize) {
       final overflow = _queue.length - _options.maxQueueSize;
       _queue.removeRange(0, overflow);
-      _log('queue exceeded ${_options.maxQueueSize}; dropped $overflow oldest op(s)');
+      _emit('dropped',
+          'queue exceeded ${_options.maxQueueSize}; dropped $overflow oldest op(s)');
+      _log(
+          'queue exceeded ${_options.maxQueueSize}; dropped $overflow oldest op(s)');
     }
     await _persist();
   }
@@ -259,7 +283,8 @@ class WhisperrClient {
       if (decoded is! List) return;
       for (final entry in decoded) {
         if (entry is Map) {
-          _queue.add(WhisperrQueueOp.fromJson(Map<String, dynamic>.from(entry)));
+          _queue
+              .add(WhisperrQueueOp.fromJson(Map<String, dynamic>.from(entry)));
         }
       }
     } catch (e) {
@@ -269,7 +294,8 @@ class WhisperrClient {
 
   Future<void> _persist() async {
     try {
-      await _persistence.save(jsonEncode(_queue.map((o) => o.toJson()).toList()));
+      await _persistence
+          .save(jsonEncode(_queue.map((o) => o.toJson()).toList()));
     } catch (e) {
       _log('failed to persist queue ($e)');
     }
@@ -284,7 +310,8 @@ class WhisperrClient {
     return Duration(milliseconds: capped + jitter);
   }
 
-  String _nextId() => '${_clock().microsecondsSinceEpoch}-${_seq++}-${_random.nextInt(0x7fffffff)}';
+  String _nextId() =>
+      '${_clock().microsecondsSinceEpoch}-${_seq++}-${_random.nextInt(0x7fffffff)}';
 
   void _ensureUsable() {
     if (_closed) throw StateError('Whisperr client has been closed.');
@@ -292,6 +319,15 @@ class WhisperrClient {
 
   void _log(String message) {
     if (_options.debug) debugPrint('[whisperr] $message');
+  }
+
+  void _emit(String type, String message, {int? status}) {
+    try {
+      _options.onError
+          ?.call(WhisperrError(type: type, message: message, status: status));
+    } catch (_) {
+      // host callback threw — ignore
+    }
   }
 }
 
@@ -341,9 +377,12 @@ class Whisperr {
       sdkVersion: kWhisperrSdkVersion,
       timeout: options.requestTimeout,
     );
-    final persistence = options.enablePersistence ? SharedPreferencesPersistence() : InMemoryPersistence();
+    final persistence = options.enablePersistence
+        ? SharedPreferencesPersistence()
+        : InMemoryPersistence();
 
-    final client = WhisperrClient(apiClient: api, persistence: persistence, options: options);
+    final client = WhisperrClient(
+        apiClient: api, persistence: persistence, options: options);
     await client.start();
     _instance = client;
   }

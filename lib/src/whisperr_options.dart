@@ -1,3 +1,5 @@
+import 'models.dart';
+
 /// Tunable behavior for the Whisperr client.
 class WhisperrOptions {
   const WhisperrOptions({
@@ -12,6 +14,7 @@ class WhisperrOptions {
     this.enablePersistence = true,
     this.flushOnLifecyclePause = true,
     this.debug = false,
+    this.onError,
   })  : assert(flushAt > 0),
         assert(maxBatchSize > 0 && maxBatchSize <= 500),
         assert(maxQueueSize >= flushAt);
@@ -50,4 +53,9 @@ class WhisperrOptions {
 
   /// Emit verbose logs via `debugPrint`.
   final bool debug;
+
+  /// Called after delivery failures are classified (`auth`,
+  /// `retry_exhausted`, `dropped`). The SDK still applies its normal
+  /// retain/drop behavior even if this callback throws.
+  final void Function(WhisperrError error)? onError;
 }
