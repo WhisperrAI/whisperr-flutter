@@ -6,7 +6,7 @@ Identify your users and track product events so Whisperr can decide and deliver 
 
 ```yaml
 dependencies:
-  whisperr: ^0.2.3
+  whisperr: ^0.3.0
 ```
 
 ## Initialize
@@ -31,6 +31,7 @@ await Whisperr.instance.identify(
   'user_123',
   email: 'ada@example.com',
   phone: '+15551234567',
+  pushToken: fcmToken, // expands to an opted-in push channel
   traits: {'name': 'Ada', 'plan': 'pro'},
 );
 
@@ -45,6 +46,38 @@ await Whisperr.instance.identify(
 ```
 
 > Whisperr decides which channel to actually use based on engagement — there's no "preferred channel" to set. Express an explicit user choice via `optedIn: false` on the channels they don't want.
+
+## Push notifications
+
+The SDK never bundles a push library — hand it the token your own messaging
+setup produces (e.g. `firebase_messaging`) and Whisperr keeps the `push`
+channel current:
+
+```dart
+import 'package:firebase_messaging/firebase_messaging.dart';
+
+final messaging = FirebaseMessaging.instance;
+
+// Current token (safe on every launch — repeats are a no-op):
+final token = await messaging.getToken();
+if (token != null) await Whisperr.instance.setPushToken(token);
+
+// Rotations, forwarded automatically:
+final sub = Whisperr.instance.attachPushTokenStream(messaging.onTokenRefresh);
+```
+
+- Called **after login**, `setPushToken` re-identifies the push channel
+  immediately.
+- Called **before login**, the token is buffered and attached to the next
+  `identify()`.
+- **Repeats are deduped across restarts**: the last-sent (user, token) pair is
+  persisted alongside the queue, so calling `getToken()` + `setPushToken` on
+  every launch never re-sends an identify for an unchanged token.
+- **Token rotation** is handled: the previously sent token is opted out and the
+  new one opted in, so stale tokens don't accumulate — and tokens from the
+  user's other devices are never touched.
+- After `reset()` (logout), call `setPushToken` again once the next user logs
+  in.
 
 ## Track
 
