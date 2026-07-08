@@ -70,6 +70,9 @@ final sub = Whisperr.instance.attachPushTokenStream(messaging.onTokenRefresh);
   immediately.
 - Called **before login**, the token is buffered and attached to the next
   `identify()`.
+- **Repeats are deduped across restarts**: the last-sent (user, token) pair is
+  persisted alongside the queue, so calling `getToken()` + `setPushToken` on
+  every launch never re-sends an identify for an unchanged token.
 - **Token rotation** is handled: the previously sent token is opted out and the
   new one opted in, so stale tokens don't accumulate — and tokens from the
   user's other devices are never touched.

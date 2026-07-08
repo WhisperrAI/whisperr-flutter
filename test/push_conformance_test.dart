@@ -27,7 +27,7 @@ Future<Map<String, dynamic>> _loadSpec() async {
   return jsonDecode(res.body) as Map<String, dynamic>;
 }
 
-WhisperrClient _client(MockClient mock) {
+WhisperrClient _client(MockClient mock, WhisperrPersistence persistence) {
   final api = WhisperrApiClient(
     httpClient: mock,
     baseUrl: 'https://api.test',
@@ -36,7 +36,7 @@ WhisperrClient _client(MockClient mock) {
   );
   return WhisperrClient(
     apiClient: api,
-    persistence: InMemoryPersistence(),
+    persistence: persistence,
     options: const WhisperrOptions(
       flushOnLifecyclePause: false,
       retryBaseDelay: Duration(milliseconds: 1),
@@ -63,12 +63,21 @@ void main() {
         return http.Response(
             '{"user":{"id":"u","external_id":"u","created":true}}', 200);
       });
-      final client = _client(mock);
-      addTearDown(client.close);
+      final persistence = InMemoryPersistence();
+      var client = _client(mock, persistence);
+      addTearDown(() => client.close());
       await client.start();
 
       for (final raw in c['steps'] as List) {
         final step = raw as Map<String, dynamic>;
+        if (step.containsKey('restart')) {
+          // App relaunch: tear the client down and build a fresh instance on
+          // the SAME persistence — identity and last-sent token must restore.
+          await client.close();
+          client = _client(mock, persistence);
+          await client.start();
+          continue;
+        }
         if (step.containsKey('identify')) {
           final s = Map<String, dynamic>.from(step['identify'] as Map);
           await client.identify(

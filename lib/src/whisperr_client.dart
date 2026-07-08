@@ -48,9 +48,11 @@ class WhisperrClient {
   final List<WhisperrQueueOp> _queue = [];
   String? _currentUserId;
   /// Token captured before identify(); attached to the next identify.
+  /// Memory-only by design: FCM/APNs re-deliver the token on every launch.
   String? _pendingPushToken;
   /// Last push token delivered and for which user — dedups refresh storms and
-  /// lets a rotation opt the previous token out.
+  /// lets a rotation opt the previous token out. Persisted (and restored on
+  /// start) so the dedupe survives app restarts.
   String? _lastPushToken;
   String? _lastPushUserId;
   Timer? _timer;
@@ -60,15 +62,16 @@ class WhisperrClient {
   bool _closed = false;
   int _seq = 0;
 
-  /// The most recently identified user id, if any.
+  /// The most recently identified user id, if any. Restored from persistence
+  /// on [start], so it survives app restarts.
   String? get currentUserId => _currentUserId;
 
   /// Number of operations currently buffered (visible for tests/diagnostics).
   @visibleForTesting
   int get pendingCount => _queue.length;
 
-  /// Loads any persisted queue, starts the periodic flusher, and (on Flutter)
-  /// attaches an app-lifecycle flush.
+  /// Loads persisted state (queue, identity, last-sent push token), starts the
+  /// periodic flusher, and (on Flutter) attaches an app-lifecycle flush.
   Future<void> start() async {
     if (_started) return;
     _started = true;
@@ -118,6 +121,7 @@ class WhisperrClient {
           externalUserId, 'externalUserId', 'must not be empty');
     }
     _currentUserId = id;
+    await _persistIdentity();
 
     final resolved = <WhisperrChannel>[
       if (email != null && email.trim().isNotEmpty)
@@ -129,13 +133,15 @@ class WhisperrClient {
       ...?channels,
     ];
     // A token buffered by setPushToken() rides along unless the caller
-    // supplied its own push channel.
+    // supplied its own push channel — or the pair was already delivered
+    // (e.g. restored after a restart), in which case re-sending is redundant.
     final pending = _pendingPushToken;
     if (pending != null &&
-        !resolved.any((c) => c.type == WhisperrChannelType.push)) {
+        !resolved.any((c) => c.type == WhisperrChannelType.push) &&
+        !(_lastPushUserId == id && _lastPushToken == pending)) {
       resolved.add(WhisperrChannel.push(pending, optedIn: true));
     }
-    _rememberPushChannel(id, resolved);
+    await _rememberPushChannel(id, resolved);
     _pendingPushToken = null;
 
     final body = <String, dynamic>{'external_user_id': id};
@@ -156,9 +162,10 @@ class WhisperrClient {
   ///
   /// With a known user this re-identifies the push channel immediately: a
   /// rotated token opts the previously sent one out, and setting the same
-  /// token again is a no-op (safe to wire to `onTokenRefresh` or call on every
-  /// launch). Called before [identify], the token is buffered in memory and
-  /// attached to the next identify.
+  /// token again is a no-op — the last-sent (user, token) pair is persisted,
+  /// so this holds across app restarts too (safe to wire to `onTokenRefresh`
+  /// or call on every launch). Called before [identify], the token is buffered
+  /// in memory and attached to the next identify.
   Future<void> setPushToken(String token) async {
     _ensureUsable();
     final t = token.trim();
@@ -185,6 +192,7 @@ class WhisperrClient {
         id: _nextId(), kind: WhisperrOpKind.identify, body: body));
     _lastPushUserId = uid;
     _lastPushToken = t;
+    await _persistPushState();
     _pendingPushToken = null;
     unawaited(flush());
   }
@@ -258,12 +266,16 @@ class WhisperrClient {
   }
 
   /// Clears the current user (e.g. on logout) after flushing pending work.
+  /// Also clears the persisted identity and last-sent push-token pair, so the
+  /// next user's `setPushToken` re-registers the device.
   Future<void> reset() async {
     await flush();
     _currentUserId = null;
     _pendingPushToken = null;
     _lastPushToken = null;
     _lastPushUserId = null;
+    await _persistIdentity();
+    await _persistPushState();
   }
 
   /// Flushes, stops timers, and releases resources. The instance is unusable
@@ -281,13 +293,17 @@ class WhisperrClient {
   // --- internals ---
 
   /// Records the opted-in push channel (if any) that an identify just sent.
-  void _rememberPushChannel(String userId, List<WhisperrChannel> channels) {
+  Future<void> _rememberPushChannel(
+      String userId, List<WhisperrChannel> channels) async {
+    var changed = false;
     for (final c in channels) {
       if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) {
         _lastPushUserId = userId;
         _lastPushToken = c.address;
+        changed = true;
       }
     }
+    if (changed) await _persistPushState();
   }
 
   Future<void> _drain() async {
@@ -362,27 +378,83 @@ class WhisperrClient {
 
   Future<void> _restore() async {
     try {
-      final raw = await _persistence.load();
-      if (raw == null || raw.isEmpty) return;
-      final decoded = jsonDecode(raw);
-      if (decoded is! List) return;
-      for (final entry in decoded) {
-        if (entry is Map) {
-          _queue
-              .add(WhisperrQueueOp.fromJson(Map<String, dynamic>.from(entry)));
+      final raw = await _persistence.load(WhisperrPersistence.queueSlot);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is List) {
+          for (final entry in decoded) {
+            if (entry is Map) {
+              _queue.add(
+                  WhisperrQueueOp.fromJson(Map<String, dynamic>.from(entry)));
+            }
+          }
         }
       }
     } catch (e) {
       _log('failed to restore persisted queue ($e)');
     }
+    try {
+      final raw = await _persistence.load(WhisperrPersistence.identitySlot);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map && decoded['user_id'] is String) {
+          _currentUserId = decoded['user_id'] as String;
+        }
+      }
+    } catch (e) {
+      _log('failed to restore persisted identity ($e)');
+    }
+    try {
+      final raw = await _persistence.load(WhisperrPersistence.pushSlot);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map &&
+            decoded['user_id'] is String &&
+            decoded['token'] is String) {
+          _lastPushUserId = decoded['user_id'] as String;
+          _lastPushToken = decoded['token'] as String;
+        }
+      }
+    } catch (e) {
+      _log('failed to restore persisted push state ($e)');
+    }
   }
 
   Future<void> _persist() async {
     try {
-      await _persistence
-          .save(jsonEncode(_queue.map((o) => o.toJson()).toList()));
+      await _persistence.save(WhisperrPersistence.queueSlot,
+          jsonEncode(_queue.map((o) => o.toJson()).toList()));
     } catch (e) {
       _log('failed to persist queue ($e)');
+    }
+  }
+
+  Future<void> _persistIdentity() async {
+    try {
+      final uid = _currentUserId;
+      if (uid == null) {
+        await _persistence.clear(WhisperrPersistence.identitySlot);
+      } else {
+        await _persistence.save(
+            WhisperrPersistence.identitySlot, jsonEncode({'user_id': uid}));
+      }
+    } catch (e) {
+      _log('failed to persist identity ($e)');
+    }
+  }
+
+  Future<void> _persistPushState() async {
+    try {
+      final uid = _lastPushUserId;
+      final token = _lastPushToken;
+      if (uid == null || token == null) {
+        await _persistence.clear(WhisperrPersistence.pushSlot);
+      } else {
+        await _persistence.save(WhisperrPersistence.pushSlot,
+            jsonEncode({'user_id': uid, 'token': token}));
+      }
+    } catch (e) {
+      _log('failed to persist push state ($e)');
     }
   }
 

@@ -184,7 +184,7 @@ void main() {
     expect(c1.pendingCount, 1);
     await c1.close();
 
-    expect(await store.load(), isNotNull);
+    expect(await store.load(WhisperrPersistence.queueSlot), isNotNull);
 
     online = true;
     final c2 = buildClient(mock, persistence: store);
@@ -247,6 +247,75 @@ void main() {
 
     expect(batches, 1);
     expect(client.pendingCount, 0);
+  });
+
+  test('reset clears the persisted push pair so the token re-sends', () async {
+    final store = InMemoryPersistence();
+    final identifies = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      if (req.url.path == '/v1/identify') {
+        identifies.add(jsonDecode(req.body) as Map<String, dynamic>);
+      }
+      return http.Response(
+          '{"user":{"id":"x","external_id":"u1","created":true}}', 200);
+    });
+
+    final c1 = buildClient(mock, persistence: store);
+    await c1.start();
+    await c1.identify('u1');
+    await c1.setPushToken('tok_a');
+    await c1.reset(); // logout: clears identity + persisted push pair
+    await c1.close();
+
+    final c2 = buildClient(mock, persistence: store);
+    addTearDown(c2.close);
+    await c2.start();
+    expect(c2.currentUserId, isNull); // reset cleared the persisted identity
+
+    await c2.identify('u1');
+    await c2.setPushToken('tok_a'); // must send again — pair was cleared
+    await c2.flush();
+
+    final pushBodies =
+        identifies.where((b) => b.containsKey('channels')).toList();
+    expect(pushBodies, hasLength(2));
+    // No opt-out entry: the previous pair was forgotten on reset.
+    expect(pushBodies.last['channels'],
+        [{'channel': 'push', 'address': 'tok_a', 'opted_in': true}]);
+  });
+
+  test(
+      'a token buffered before identify that matches the restored pair is not re-sent',
+      () async {
+    final store = InMemoryPersistence();
+    final identifies = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      if (req.url.path == '/v1/identify') {
+        identifies.add(jsonDecode(req.body) as Map<String, dynamic>);
+      }
+      return http.Response(
+          '{"user":{"id":"x","external_id":"u1","created":true}}', 200);
+    });
+
+    final c1 = buildClient(mock, persistence: store);
+    await c1.start();
+    await c1.identify('u1');
+    await c1.setPushToken('tok_a');
+    await c1.close();
+
+    // Relaunch where getToken() fires before the client starts: the token is
+    // buffered, then identify() must NOT re-attach it — the restored last-sent
+    // pair says this exact (user, token) was already delivered.
+    final c2 = buildClient(mock, persistence: store);
+    addTearDown(c2.close);
+    await c2.setPushToken('tok_a'); // buffered (no user known yet)
+    await c2.start();
+    await c2.identify('u1');
+    await c2.flush();
+
+    // identify #1, push partial identify, identify #3 (no push channel).
+    expect(identifies, hasLength(3));
+    expect(identifies.last, {'external_user_id': 'u1'});
   });
 
   test('identify is delivered before subsequent tracks (ordered queue)',
