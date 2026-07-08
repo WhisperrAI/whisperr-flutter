@@ -11,7 +11,7 @@ import 'persistence.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.2.4';
+const String kWhisperrSdkVersion = '0.3.0';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
@@ -47,6 +47,12 @@ class WhisperrClient {
 
   final List<WhisperrQueueOp> _queue = [];
   String? _currentUserId;
+  /// Token captured before identify(); attached to the next identify.
+  String? _pendingPushToken;
+  /// Last push token delivered and for which user — dedups refresh storms and
+  /// lets a rotation opt the previous token out.
+  String? _lastPushToken;
+  String? _lastPushUserId;
   Timer? _timer;
   Future<void>? _flushing;
   AppLifecycleListener? _lifecycle;
@@ -122,6 +128,15 @@ class WhisperrClient {
         WhisperrChannel.push(pushToken.trim(), optedIn: true),
       ...?channels,
     ];
+    // A token buffered by setPushToken() rides along unless the caller
+    // supplied its own push channel.
+    final pending = _pendingPushToken;
+    if (pending != null &&
+        !resolved.any((c) => c.type == WhisperrChannelType.push)) {
+      resolved.add(WhisperrChannel.push(pending, optedIn: true));
+    }
+    _rememberPushChannel(id, resolved);
+    _pendingPushToken = null;
 
     final body = <String, dynamic>{'external_user_id': id};
     if (traits != null && traits.isNotEmpty) body['traits'] = traits;
@@ -135,6 +150,56 @@ class WhisperrClient {
     await _enqueue(WhisperrQueueOp(
         id: _nextId(), kind: WhisperrOpKind.identify, body: body));
     unawaited(flush());
+  }
+
+  /// Captures the device push token (FCM registration token / hex APNs token).
+  ///
+  /// With a known user this re-identifies the push channel immediately: a
+  /// rotated token opts the previously sent one out, and setting the same
+  /// token again is a no-op (safe to wire to `onTokenRefresh` or call on every
+  /// launch). Called before [identify], the token is buffered in memory and
+  /// attached to the next identify.
+  Future<void> setPushToken(String token) async {
+    _ensureUsable();
+    final t = token.trim();
+    if (t.isEmpty) {
+      throw ArgumentError.value(token, 'token', 'must not be empty');
+    }
+    final uid = _currentUserId;
+    if (uid == null) {
+      _pendingPushToken = t; // attached to the next identify()
+      return;
+    }
+    final last = _lastPushUserId == uid ? _lastPushToken : null;
+    if (last == t) return; // refresh storm — token unchanged
+    final channels = <WhisperrChannel>[
+      // Rotation: retire the token this client previously registered.
+      if (last != null) WhisperrChannel.push(last, optedIn: false),
+      WhisperrChannel.push(t, optedIn: true),
+    ];
+    final body = <String, dynamic>{
+      'external_user_id': uid,
+      'channels': channels.map((c) => c.toJson()).toList(),
+    };
+    await _enqueue(WhisperrQueueOp(
+        id: _nextId(), kind: WhisperrOpKind.identify, body: body));
+    _lastPushUserId = uid;
+    _lastPushToken = t;
+    _pendingPushToken = null;
+    unawaited(flush());
+  }
+
+  /// Forwards every token a stream emits to [setPushToken]. Plugs directly
+  /// into `FirebaseMessaging.instance.onTokenRefresh`:
+  ///
+  /// ```dart
+  /// final sub = client.attachPushTokenStream(
+  ///     FirebaseMessaging.instance.onTokenRefresh);
+  /// ```
+  ///
+  /// Cancel the returned subscription when the client is closed.
+  StreamSubscription<String> attachPushTokenStream(Stream<String> tokens) {
+    return tokens.listen((token) => unawaited(setPushToken(token)));
   }
 
   /// Tracks a product event for the current (or explicitly given) user.
@@ -196,6 +261,9 @@ class WhisperrClient {
   Future<void> reset() async {
     await flush();
     _currentUserId = null;
+    _pendingPushToken = null;
+    _lastPushToken = null;
+    _lastPushUserId = null;
   }
 
   /// Flushes, stops timers, and releases resources. The instance is unusable
@@ -211,6 +279,16 @@ class WhisperrClient {
   }
 
   // --- internals ---
+
+  /// Records the opted-in push channel (if any) that an identify just sent.
+  void _rememberPushChannel(String userId, List<WhisperrChannel> channels) {
+    for (final c in channels) {
+      if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) {
+        _lastPushUserId = userId;
+        _lastPushToken = c.address;
+      }
+    }
+  }
 
   Future<void> _drain() async {
     var attempt = 0;

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- `setPushToken(token)`: first-class push-token capture. Re-identifies the
+  `push` channel for the current user, buffers tokens set before `identify()`,
+  no-ops on repeated tokens, and opts the previous token out on rotation —
+  matching the other Whisperr SDKs and verified against the new
+  `whisperr-spec` `conformance/push.json` fixtures.
+- `attachPushTokenStream(tokens)`: dependency-free glue for
+  `FirebaseMessaging.instance.onTokenRefresh` (or any token stream).
+- `reset()` now also clears buffered/remembered push tokens.
+
 ## 0.2.4
 
 - Truncate `occurred_at` to millisecond precision (RFC3339 `Z`), matching the spec and the other Whisperr SDKs. Dart's `DateTime.toIso8601String()` emits microseconds, which previously went out verbatim.
