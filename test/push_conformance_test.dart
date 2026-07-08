@@ -78,11 +78,17 @@ void main() {
           await client.start();
           continue;
         }
+        if (step.containsKey('reset')) {
+          await client.reset(); // logout: clears identity + last-sent pair
+          await client.flush();
+          continue;
+        }
         if (step.containsKey('identify')) {
           final s = Map<String, dynamic>.from(step['identify'] as Map);
           await client.identify(
             s['externalUserId'] as String,
             traits: s['traits'] as Map<String, dynamic>?,
+            pushToken: s['pushToken'] as String?,
           );
         } else {
           await client.setPushToken(step['setPushToken'] as String);
