@@ -11,7 +11,7 @@ import 'persistence.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.3.0';
+const String kWhisperrSdkVersion = '0.3.1';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
@@ -58,6 +58,9 @@ class WhisperrClient {
   Timer? _timer;
   Future<void>? _flushing;
   AppLifecycleListener? _lifecycle;
+  /// Push-token stream subscriptions opened by [attachPushTokenStream];
+  /// cancelled on [close] so late token emissions can't reach a dead client.
+  final List<StreamSubscription<String>> _pushSubscriptions = [];
   bool _started = false;
   bool _closed = false;
   int _seq = 0;
@@ -141,6 +144,22 @@ class WhisperrClient {
         !(_lastPushUserId == id && _lastPushToken == pending)) {
       resolved.add(WhisperrChannel.push(pending, optedIn: true));
     }
+    // Rotation: if this identify registers a push token that differs from the
+    // last one we sent for this user, opt the old one out in the same body —
+    // exactly like setPushToken — so a token passed to identify() (via
+    // pushToken: or an explicit push channel) isn't stranded opted-in.
+    WhisperrChannel? newPush;
+    for (final c in resolved) {
+      if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) newPush = c;
+    }
+    final lastForUser = _lastPushUserId == id ? _lastPushToken : null;
+    if (newPush != null &&
+        lastForUser != null &&
+        lastForUser != newPush.address &&
+        !resolved.any((c) =>
+            c.type == WhisperrChannelType.push && c.address == lastForUser)) {
+      resolved.insert(0, WhisperrChannel.push(lastForUser, optedIn: false));
+    }
     await _rememberPushChannel(id, resolved);
     _pendingPushToken = null;
 
@@ -169,9 +188,10 @@ class WhisperrClient {
   Future<void> setPushToken(String token) async {
     _ensureUsable();
     final t = token.trim();
-    if (t.isEmpty) {
-      throw ArgumentError.value(token, 'token', 'must not be empty');
-    }
+    // An empty / whitespace token is silently ignored: getToken() can return an
+    // empty string before the device has registered, and this is documented as
+    // safe to call on every launch, so it must be a no-op (not an error).
+    if (t.isEmpty) return;
     final uid = _currentUserId;
     if (uid == null) {
       _pendingPushToken = t; // attached to the next identify()
@@ -188,12 +208,14 @@ class WhisperrClient {
       'external_user_id': uid,
       'channels': channels.map((c) => c.toJson()).toList(),
     };
-    await _enqueue(WhisperrQueueOp(
-        id: _nextId(), kind: WhisperrOpKind.identify, body: body));
+    // Mark the last-sent pair BEFORE enqueue so an overflow-evicted registration
+    // clears the mark (mark-on-delivery), never stranding a token opted-out.
     _lastPushUserId = uid;
     _lastPushToken = t;
     await _persistPushState();
     _pendingPushToken = null;
+    await _enqueue(WhisperrQueueOp(
+        id: _nextId(), kind: WhisperrOpKind.identify, body: body));
     unawaited(flush());
   }
 
@@ -205,9 +227,25 @@ class WhisperrClient {
   ///     FirebaseMessaging.instance.onTokenRefresh);
   /// ```
   ///
-  /// Cancel the returned subscription when the client is closed.
+  /// The subscription is also tracked and cancelled by [close], so a token
+  /// emitted after the client is torn down can never reach it.
   StreamSubscription<String> attachPushTokenStream(Stream<String> tokens) {
-    return tokens.listen((token) => unawaited(setPushToken(token)));
+    final sub = tokens.listen(
+      (token) {
+        // setPushToken is async and may reject (e.g. the client was closed
+        // between emission and delivery). Guard it so a throw never escapes as
+        // an uncaught zone error and crashes the app — report and move on.
+        unawaited(setPushToken(token).catchError((Object error) {
+          _log('setPushToken from stream failed: $error');
+        }));
+      },
+      // Without onError, an error from the token source propagates to the zone
+      // as an uncaught async error. Swallow-and-report instead.
+      onError: (Object error) => _log('push-token stream error: $error'),
+      cancelOnError: false,
+    );
+    _pushSubscriptions.add(sub);
+    return sub;
   }
 
   /// Tracks a product event for the current (or explicitly given) user.
@@ -288,6 +326,10 @@ class WhisperrClient {
     _timer = null;
     _lifecycle?.dispose();
     _lifecycle = null;
+    for (final sub in _pushSubscriptions) {
+      await sub.cancel();
+    }
+    _pushSubscriptions.clear();
   }
 
   // --- internals ---
@@ -304,6 +346,33 @@ class WhisperrClient {
       }
     }
     if (changed) await _persistPushState();
+  }
+
+  /// A dropped (4xx) or overflow-evicted op never reached the server, so the
+  /// (user, token) pair it would have registered must not stay marked as
+  /// delivered — otherwise a single rejection wedges that token opted-out of
+  /// every future setPushToken. Clears the mark when a discarded op carried it.
+  Future<void> _forgetPushMark(Iterable<WhisperrQueueOp> discarded) async {
+    final token = _lastPushToken;
+    final user = _lastPushUserId;
+    if (token == null || user == null) return;
+    for (final op in discarded) {
+      if (op.kind != WhisperrOpKind.identify) continue;
+      if (op.body['external_user_id'] != user) continue;
+      final channels = op.body['channels'];
+      if (channels is! List) continue;
+      final carried = channels.any((c) =>
+          c is Map &&
+          c['channel'] == 'push' &&
+          c['address'] == token &&
+          (c['opted_in'] == null || c['opted_in'] == true));
+      if (carried) {
+        _lastPushUserId = null;
+        _lastPushToken = null;
+        await _persistPushState();
+        return;
+      }
+    }
   }
 
   Future<void> _drain() async {
@@ -339,6 +408,7 @@ class WhisperrClient {
           _emit('dropped', 'dropped op after permanent client error',
               status: e.statusCode);
           _log('dropping op after permanent client error ($e)');
+          await _forgetPushMark([head]); // registration rejected — let it re-send
           _queue.removeAt(0);
           await _persist();
           continue;
@@ -367,7 +437,9 @@ class WhisperrClient {
     _queue.add(op);
     if (_queue.length > _options.maxQueueSize) {
       final overflow = _queue.length - _options.maxQueueSize;
+      final evicted = _queue.sublist(0, overflow);
       _queue.removeRange(0, overflow);
+      await _forgetPushMark(evicted); // an evicted registration never shipped
       _emit('dropped',
           'queue exceeded ${_options.maxQueueSize}; dropped $overflow oldest op(s)');
       _log(

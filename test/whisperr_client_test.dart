@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -337,5 +338,129 @@ void main() {
     await client.flush();
 
     expect(paths, ['/v1/identify', '/v1/events/batch']);
+  });
+
+  test('setPushToken silently ignores empty/whitespace tokens', () async {
+    final identifies = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      if (req.url.path == '/v1/identify') {
+        identifies.add(jsonDecode(req.body) as Map<String, dynamic>);
+      }
+      return http.Response(
+          '{"user":{"id":"x","external_id":"u1","created":true}}', 200);
+    });
+    final client = buildClient(mock);
+    addTearDown(client.close);
+    await client.start();
+
+    await client.identify('u1');
+    await client.flush();
+    identifies.clear();
+    // No throw, no request — safe to call every launch before getToken() is ready.
+    await client.setPushToken('');
+    await client.setPushToken('   ');
+    await client.flush();
+
+    expect(identifies, isEmpty);
+  });
+
+  test('attachPushTokenStream forwards tokens and survives a source error',
+      () async {
+    final identifies = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      if (req.url.path == '/v1/identify') {
+        identifies.add(jsonDecode(req.body) as Map<String, dynamic>);
+      }
+      return http.Response(
+          '{"user":{"id":"x","external_id":"u1","created":true}}', 200);
+    });
+    final client = buildClient(mock);
+    addTearDown(client.close);
+    await client.start();
+    await client.identify('u1');
+    await client.flush();
+    identifies.clear();
+
+    final controller = StreamController<String>();
+    client.attachPushTokenStream(controller.stream);
+
+    // A source error must be handled, not surface as an uncaught zone error
+    // (which would fail this test).
+    controller.addError(StateError('token source blew up'));
+    await Future<void>.delayed(Duration.zero);
+    controller.add('fcm_tok_a');
+    await Future<void>.delayed(Duration.zero);
+    await client.flush();
+    await controller.close();
+
+    expect(identifies, hasLength(1));
+    expect(identifies.first['channels'], [
+      {'channel': 'push', 'address': 'fcm_tok_a', 'opted_in': true}
+    ]);
+  });
+
+  test('close() cancels attached push-token subscriptions', () async {
+    final identifies = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      if (req.url.path == '/v1/identify') {
+        identifies.add(jsonDecode(req.body) as Map<String, dynamic>);
+      }
+      return http.Response(
+          '{"user":{"id":"x","external_id":"u1","created":true}}', 200);
+    });
+    final client = buildClient(mock);
+    await client.start();
+    await client.identify('u1');
+
+    final controller = StreamController<String>();
+    client.attachPushTokenStream(controller.stream);
+    await client.close();
+    identifies.clear();
+
+    // Emitting after close() must be inert — the subscription was cancelled, so
+    // setPushToken is never invoked on the dead client (no throw, no request).
+    controller.add('fcm_tok_late');
+    await Future<void>.delayed(Duration.zero);
+    await controller.close();
+
+    expect(identifies, isEmpty);
+  });
+
+  test('a dropped push registration clears the dedupe mark so it re-sends',
+      () async {
+    var rejectPush = true;
+    final pushBodies = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      if (req.url.path == '/v1/identify') {
+        final body = jsonDecode(req.body) as Map<String, dynamic>;
+        if (body.containsKey('channels')) {
+          pushBodies.add(body);
+          if (rejectPush) {
+            return http.Response(
+                '{"error":{"code":"invalid_request","message":"bad"}}', 400);
+          }
+        }
+      }
+      return http.Response(
+          '{"user":{"id":"x","external_id":"u1","created":true}}', 200);
+    });
+    final client = buildClient(mock);
+    addTearDown(client.close);
+    await client.start();
+
+    await client.identify('u1');
+    await client.setPushToken('fcm_tok_a'); // 400 → dropped, mark cleared
+    await client.flush();
+    expect(pushBodies, hasLength(1));
+
+    rejectPush = false;
+    pushBodies.clear();
+    await client.setPushToken('fcm_tok_a'); // same token — must re-send
+    await client.flush();
+
+    expect(pushBodies, hasLength(1));
+    expect(pushBodies.first['channels'], [
+      {'channel': 'push', 'address': 'fcm_tok_a', 'opted_in': true}
+    ]);
   });
 }

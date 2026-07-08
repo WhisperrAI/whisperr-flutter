@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.1
+
+- Fix: `attachPushTokenStream` now guards against uncaught async errors. The
+  listener has an `onError` handler (a failing token source is reported, not
+  thrown into the zone) and wraps `setPushToken` so its rejections can't escape
+  and crash the app. `close()` now cancels every subscription opened by
+  `attachPushTokenStream`, so a token emitted after teardown can't reach a dead
+  client.
+- Fix: `setPushToken('')` / whitespace-only tokens are now silently ignored
+  instead of throwing `ArgumentError` — `getToken()` can return an empty string
+  before the device registers, and the method is documented as safe to call on
+  every launch. This aligns Flutter with the React Native and Swift SDKs.
+- Fix: the dedup pair is a mark of what was **delivered**. A registration whose
+  request is dropped (non-retryable `4xx`) or evicted on queue overflow now
+  clears the pair, so the token re-registers next time instead of being wedged
+  opted-out forever by a single rejection.
+- `identify(pushToken:)` (or an explicit push channel on identify) now rotates
+  like `setPushToken`: a differing token opts the previous one out in the same
+  body instead of stranding it opted-in.
+- Verified against the hardened `whisperr-spec` `conformance/push.json` (reset,
+  empty-token, `identify(pushToken:)`, and restart-then-reidentify cases).
+
 ## 0.3.0
 
 - `setPushToken(token)`: first-class push-token capture. Re-identifies the
