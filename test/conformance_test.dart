@@ -41,6 +41,9 @@ WhisperrClient _client(MockClient mock, {DateTime? clock}) {
     ),
     clock: () => clock ?? DateTime.utc(2026, 5, 31, 12),
     random: Random(7),
+    // Device-trait defaults are environment-dependent and never pinned by
+    // the spec fixtures; device_traits_test.dart covers them.
+    deviceTraits: () => const <String, Object?>{},
   );
 }
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `identify()` now fills the reserved traits `locale` (BCP 47, from the
+  platform locale) and `timezone_offset_minutes` (the device's UTC offset in
+  minutes, east-positive) by default, so the engine can pick the message
+  language and approximate quiet hours. Flutter cannot obtain an IANA zone name
+  without a plugin, so `timezone` is never guessed — pass
+  `traits: {'timezone': 'Europe/Berlin'}` when the app knows it, and the offset
+  fallback is dropped. Caller-supplied values always win; `setPushToken()`'s
+  partial identify stays traits-free. `WhisperrClient` gains an injectable
+  `deviceTraits` resolver for tests.
+
 ## 0.3.1
 
 - Fix: `attachPushTokenStream` now guards against uncaught async errors. The

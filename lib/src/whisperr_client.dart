@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
 
 import 'api_client.dart';
+import 'device_traits.dart';
 import 'models.dart';
 import 'persistence.dart';
 import 'whisperr_options.dart';
@@ -33,17 +34,22 @@ class WhisperrClient {
     WhisperrOptions options = const WhisperrOptions(),
     DateTime Function()? clock,
     Random? random,
+    Map<String, Object?> Function()? deviceTraits,
   })  : _api = apiClient,
         _persistence = persistence,
         _options = options,
         _clock = clock ?? (() => DateTime.now().toUtc()),
-        _random = random ?? Random();
+        _random = random ?? Random(),
+        _deviceTraits = deviceTraits ?? defaultDeviceTraits;
 
   final WhisperrApiClient _api;
   final WhisperrPersistence _persistence;
   final WhisperrOptions _options;
   final DateTime Function() _clock;
   final Random _random;
+  /// Resolves the reserved identify trait defaults (see [defaultDeviceTraits]);
+  /// injectable so tests can pin or silence them.
+  final Map<String, Object?> Function() _deviceTraits;
 
   final List<WhisperrQueueOp> _queue = [];
   String? _currentUserId;
@@ -106,6 +112,13 @@ class WhisperrClient {
   /// flags, multiple addresses) build [channels] explicitly. Whisperr decides
   /// which channel to actually use, so there is no "preferred channel" to set.
   ///
+  /// The reserved traits `locale` (BCP 47, from the platform locale) and
+  /// `timezone_offset_minutes` (the device's UTC offset — Flutter cannot obtain
+  /// an IANA zone name without a plugin) are filled in by default so the engine
+  /// can pick the message language and approximate quiet hours; any value you
+  /// pass in [traits] wins, and supplying `timezone` (an IANA name) drops the
+  /// offset fallback. See [defaultDeviceTraits].
+  ///
   /// Enqueued durably and flushed in order; returns once buffered (call [flush]
   /// to await delivery).
   Future<void> identify(
@@ -164,7 +177,8 @@ class WhisperrClient {
     _pendingPushToken = null;
 
     final body = <String, dynamic>{'external_user_id': id};
-    if (traits != null && traits.isNotEmpty) body['traits'] = traits;
+    final mergedTraits = _withDeviceTraits(traits);
+    if (mergedTraits.isNotEmpty) body['traits'] = mergedTraits;
     if (preferredChannel != null && preferredChannel.trim().isNotEmpty) {
       body['preferred_channel'] = preferredChannel.trim();
     }
@@ -333,6 +347,34 @@ class WhisperrClient {
   }
 
   // --- internals ---
+
+  /// Trait keys the engine reads for the user's zone. Any of them supplied by
+  /// the caller means "don't default a timezone" (nor the offset fallback).
+  static const _timezoneKeys = ['timezone', 'time_zone', 'tz'];
+
+  /// Merges the device defaults *under* the caller's traits: caller values
+  /// always win, and a key the platform cannot provide is simply absent. Only
+  /// full identify() calls get defaults — [setPushToken]'s partial identify
+  /// stays traits-free by contract.
+  Map<String, dynamic> _withDeviceTraits(Map<String, dynamic>? traits) {
+    final defaults = _resolveDeviceTraits();
+    final supplied = traits ?? const <String, dynamic>{};
+    if (_timezoneKeys.any(supplied.containsKey)) {
+      defaults.remove('timezone');
+      defaults.remove('timezone_offset_minutes');
+    }
+    return <String, dynamic>{...defaults, ...supplied};
+  }
+
+  /// A failing resolver must never break identify(): log and send nothing.
+  Map<String, Object?> _resolveDeviceTraits() {
+    try {
+      return Map<String, Object?>.of(_deviceTraits());
+    } catch (e) {
+      _log('device traits unavailable ($e)');
+      return <String, Object?>{};
+    }
+  }
 
   /// Records the opted-in push channel (if any) that an identify just sent.
   Future<void> _rememberPushChannel(
