@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
 - `identify()` now fills the reserved traits `locale` (BCP 47, from the
   platform locale) and `timezone_offset_minutes` (the device's UTC offset in
