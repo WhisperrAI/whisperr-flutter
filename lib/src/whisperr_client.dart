@@ -47,15 +47,18 @@ class WhisperrClient {
   final WhisperrOptions _options;
   final DateTime Function() _clock;
   final Random _random;
+
   /// Resolves the reserved identify trait defaults (see [defaultDeviceTraits]);
   /// injectable so tests can pin or silence them.
   final Map<String, Object?> Function() _deviceTraits;
 
   final List<WhisperrQueueOp> _queue = [];
   String? _currentUserId;
+
   /// Token captured before identify(); attached to the next identify.
   /// Memory-only by design: FCM/APNs re-deliver the token on every launch.
   String? _pendingPushToken;
+
   /// Last push token delivered and for which user — dedups refresh storms and
   /// lets a rotation opt the previous token out. Persisted (and restored on
   /// start) so the dedupe survives app restarts.
@@ -64,6 +67,7 @@ class WhisperrClient {
   Timer? _timer;
   Future<void>? _flushing;
   AppLifecycleListener? _lifecycle;
+
   /// Push-token stream subscriptions opened by [attachPushTokenStream];
   /// cancelled on [close] so late token emissions can't reach a dead client.
   final List<StreamSubscription<String>> _pushSubscriptions = [];
@@ -163,7 +167,8 @@ class WhisperrClient {
     // pushToken: or an explicit push channel) isn't stranded opted-in.
     WhisperrChannel? newPush;
     for (final c in resolved) {
-      if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) newPush = c;
+      if (c.type == WhisperrChannelType.push && (c.optedIn ?? true))
+        newPush = c;
     }
     final lastForUser = _lastPushUserId == id ? _lastPushToken : null;
     if (newPush != null &&
@@ -319,15 +324,19 @@ class WhisperrClient {
 
   /// Clears the current user (e.g. on logout) after flushing pending work.
   /// Also clears the persisted identity and last-sent push-token pair, so the
-  /// next user's `setPushToken` re-registers the device.
-  Future<void> reset() async {
-    await flush();
+  /// next user's `setPushToken` re-registers the device. Set [flushBeforeReset]
+  /// to false on an interactive logout path: identity is cleared locally and
+  /// existing queued operations keep their original user while draining in the
+  /// background, so an offline transport cannot delay the next login.
+  Future<void> reset({bool flushBeforeReset = true}) async {
+    if (flushBeforeReset) await flush();
     _currentUserId = null;
     _pendingPushToken = null;
     _lastPushToken = null;
     _lastPushUserId = null;
     await _persistIdentity();
     await _persistPushState();
+    if (!flushBeforeReset) unawaited(flush());
   }
 
   /// Flushes, stops timers, and releases resources. The instance is unusable
@@ -450,7 +459,8 @@ class WhisperrClient {
           _emit('dropped', 'dropped op after permanent client error',
               status: e.statusCode);
           _log('dropping op after permanent client error ($e)');
-          await _forgetPushMark([head]); // registration rejected — let it re-send
+          await _forgetPushMark(
+              [head]); // registration rejected — let it re-send
           _queue.removeAt(0);
           await _persist();
           continue;

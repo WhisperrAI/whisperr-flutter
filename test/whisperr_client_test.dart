@@ -38,6 +38,23 @@ WhisperrClient buildClient(
 }
 
 void main() {
+  test('interactive reset clears identity without waiting for stalled delivery',
+      () async {
+    final response = Completer<http.Response>();
+    final client = buildClient(MockClient((_) => response.future));
+    await client.start();
+    await client.identify('old-user');
+    await client
+        .reset(flushBeforeReset: false)
+        .timeout(const Duration(seconds: 1));
+    expect(client.currentUserId, isNull);
+    await client.identify('new-user');
+    response.complete(http.Response('{}', 200));
+    await client.flush();
+    expect(client.currentUserId, 'new-user');
+    await client.close();
+  });
+
   test('identify posts a normalized body to /v1/identify with auth header',
       () async {
     final requests = <http.Request>[];
@@ -284,8 +301,9 @@ void main() {
         identifies.where((b) => b.containsKey('channels')).toList();
     expect(pushBodies, hasLength(2));
     // No opt-out entry: the previous pair was forgotten on reset.
-    expect(pushBodies.last['channels'],
-        [{'channel': 'push', 'address': 'tok_a', 'opted_in': true}]);
+    expect(pushBodies.last['channels'], [
+      {'channel': 'push', 'address': 'tok_a', 'opted_in': true}
+    ]);
   });
 
   test(

@@ -94,7 +94,7 @@ Whisperr.instance.track('checkout_completed', properties: {'amount': 42, 'curren
 ## Logout
 
 ```dart
-await Whisperr.instance.reset(); // flushes, then clears the current user
+await Whisperr.instance.reset(flushBeforeReset: false); // clears identity locally; drains in background
 ```
 
 ## How delivery works
