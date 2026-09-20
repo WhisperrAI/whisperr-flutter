@@ -167,8 +167,9 @@ class WhisperrClient {
     // pushToken: or an explicit push channel) isn't stranded opted-in.
     WhisperrChannel? newPush;
     for (final c in resolved) {
-      if (c.type == WhisperrChannelType.push && (c.optedIn ?? true))
+      if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) {
         newPush = c;
+      }
     }
     final lastForUser = _lastPushUserId == id ? _lastPushToken : null;
     if (newPush != null &&

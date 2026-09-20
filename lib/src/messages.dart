@@ -29,7 +29,6 @@ class WhisperrMessageAction {
     final locationId = target['location_id'];
     if (kind is! String || !_kinds.contains(kind) || !_validId(id)) return null;
     if (locationId != null && !_validId(locationId)) return null;
-    if (kind == 'product' && locationId == null) return null;
     return WhisperrMessageAction(
       kind: kind,
       id: id as String,
@@ -48,10 +47,10 @@ class WhisperrMessageAction {
       };
 }
 
-bool _validId(Object? value) =>
+bool _validId(Object? value, {int maxLength = 512}) =>
     value is String &&
     value.isNotEmpty &&
-    value.length <= 256 &&
+    value.length <= maxLength &&
     value.trim() == value &&
     !RegExp(r'[\x00-\x1f\x7f]').hasMatch(value);
 
@@ -133,7 +132,8 @@ class WhisperrInboxPage {
   factory WhisperrInboxPage.fromJson(Map<String, dynamic> json) {
     final raw = json['messages'];
     final cursor = json['next_cursor'];
-    if (raw is! List || (cursor != null && !_validId(cursor))) {
+    if (raw is! List ||
+        (cursor != null && !_validId(cursor, maxLength: 4096))) {
       throw const FormatException('Invalid Whisperr inbox page');
     }
     return WhisperrInboxPage(
@@ -160,6 +160,7 @@ class WhisperrActionCoordinator {
   String? _userId;
   bool _ready = false;
   int _generation = 0;
+  int _request = 0;
   WhisperrPushMessage? _pending;
   final Set<String> _opened = {};
 
@@ -175,15 +176,25 @@ class WhisperrActionCoordinator {
       if (_userId != null && userId == null) _pending = null;
       _userId = userId;
     }
+    if (_ready && !ready) _request++;
     _ready = ready;
     await _drain();
   }
 
-  Future<void> receive(WhisperrPushMessage message) async {
+  /// Explicit inbox taps may reopen a message; duplicate push deliveries cannot.
+  Future<void> receive(WhisperrPushMessage message,
+      {bool deduplicate = true}) async {
     if (_userId != null && message.userId != _userId) return;
-    if (_opened.contains(message.messageId)) return;
+    if (deduplicate && _opened.contains(message.messageId)) return;
+    _request++;
     _pending = message; // bounded: the latest explicit tap wins
     await _drain();
+  }
+
+  /// Call when the user dismisses the pending destination or cancels login.
+  void cancelPending() {
+    _request++;
+    _pending = null;
   }
 
   Future<void> _drain() async {
@@ -195,11 +206,15 @@ class WhisperrActionCoordinator {
     }
     _pending = null;
     final generation = _generation;
+    final request = _request;
     _opened.add(message.messageId);
     if (_opened.length > 100) _opened.remove(_opened.first);
     try {
       final action = await resolve(message.messageId);
-      if (generation != _generation || message.userId != _userId || !_ready) {
+      if (generation != _generation ||
+          request != _request ||
+          message.userId != _userId ||
+          !_ready) {
         return;
       }
       if (action == null) {
@@ -208,8 +223,13 @@ class WhisperrActionCoordinator {
         await open(action, message.messageId);
       }
     } catch (_) {
-      _opened.remove(message.messageId); // a later user tap may retry
-      if (generation == _generation && message.userId == _userId && _ready) {
+      if (generation == _generation && request == _request) {
+        _opened.remove(message.messageId); // a later user tap may retry
+      }
+      if (generation == _generation &&
+          request == _request &&
+          message.userId == _userId &&
+          _ready) {
         await unavailable();
       }
     }

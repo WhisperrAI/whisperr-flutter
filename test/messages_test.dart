@@ -26,7 +26,7 @@ void main() {
           'type': 'view_item',
           'target': {'kind': 'product', 'id': '901'}
         }),
-        isNull);
+        isNotNull);
     expect(
         WhisperrMessageAction.tryParse({
           'version': 1,
@@ -34,6 +34,90 @@ void main() {
           'target': {'kind': 'location', 'id': 42}
         }),
         isNull);
+  });
+
+  test('shared IDs and opaque cursor follow contract limits', () {
+    final id = 'x' * 512;
+    expect(
+        WhisperrMessageAction.tryParse(
+            WhisperrMessageAction(kind: 'product', id: id).toJson()),
+        isNotNull);
+    expect(
+        WhisperrMessageAction.tryParse(
+            WhisperrMessageAction(kind: 'product', id: '${id}x').toJson()),
+        isNull);
+    expect(
+        WhisperrInboxPage.fromJson({
+          'messages': [],
+          'next_cursor': 'c' * 4096,
+        }).nextCursor!.length,
+        4096);
+    expect(
+        () => WhisperrInboxPage.fromJson({
+              'messages': [],
+              'next_cursor': 'c' * 4097,
+            }),
+        throwsFormatException);
+  });
+
+  test('explicit inbox taps can reopen the same message', () async {
+    var opened = 0;
+    final coordinator = WhisperrActionCoordinator(
+      resolve: (_) async => product,
+      open: (_, __) async {
+        opened++;
+      },
+      unavailable: () async => fail('available'),
+    );
+    await coordinator.updateSession(userId: '123', ready: true);
+    await coordinator.receive(push);
+    await coordinator.receive(push, deduplicate: false);
+    expect(opened, 2);
+  });
+
+  test('latest tap cancels earlier out-of-order responses', () async {
+    final first = Completer<WhisperrMessageAction?>();
+    final opened = <String>[];
+    final coordinator = WhisperrActionCoordinator(
+      resolve: (id) => id == 'msg_1' ? first.future : Future.value(product),
+      open: (_, id) async {
+        opened.add(id);
+      },
+      unavailable: () async => fail('available'),
+    );
+    await coordinator.updateSession(userId: '123', ready: true);
+    final pending = coordinator.receive(push);
+    await coordinator
+        .receive(const WhisperrPushMessage(messageId: 'msg_2', userId: '123'));
+    first.complete(product);
+    await pending;
+    expect(opened, ['msg_2']);
+  });
+
+  test('cancelled login discards pending action', () async {
+    final coordinator = WhisperrActionCoordinator(
+      resolve: (_) async => fail('cancelled'),
+      open: (_, __) async => fail('cancelled'),
+      unavailable: () async => fail('cancelled'),
+    );
+    await coordinator.receive(push);
+    coordinator.cancelPending();
+    await coordinator.updateSession(userId: '123', ready: true);
+  });
+
+  test('leaving ready navigation invalidates an in-flight action', () async {
+    final response = Completer<WhisperrMessageAction?>();
+    final coordinator = WhisperrActionCoordinator(
+      resolve: (_) => response.future,
+      open: (_, __) async => fail('cancelled navigation'),
+      unavailable: () async => fail('cancelled navigation'),
+    );
+    await coordinator.updateSession(userId: '123', ready: true);
+    final receipt = coordinator.receive(push);
+    await coordinator.updateSession(userId: '123', ready: false);
+    await coordinator.updateSession(userId: '123', ready: true);
+    response.complete(product);
+    await receipt;
   });
 
   test('push parser ignores host notifications and requires recipient', () {
