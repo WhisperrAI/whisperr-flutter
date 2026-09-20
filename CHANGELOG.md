@@ -1,3 +1,8 @@
+## 0.4.0
+
+- Add versioned catalog discovery actions, namespaced push and authenticated inbox models.
+- Add a host-supplied action coordinator for startup/login deferral, recipient isolation, server resolution and unavailable-target fallback.
+
 # Changelog
 
 ## 0.3.2

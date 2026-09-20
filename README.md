@@ -124,3 +124,25 @@ await Whisperr.instance.flush(); // force delivery (e.g. before a critical await
 ## A note on the API key
 
 The ingestion key is embedded in your app, like a Segment write key or Amplitude API key. It can only ingest events for your app; treat it as publishable, not secret.
+
+## Catalog actions and message history
+
+A catalog push uses `whisperr_message_id`, `whisperr_user_id` and
+`whisperr_action` (a JSON-encoded version 1 `view_item` action). Parse it with
+`WhisperrPushMessage.tryParse`; leave ordinary app notifications alone.
+
+Use `WhisperrActionCoordinator` with your existing login/navigation lifecycle:
+call `receive` on a notification **tap**, and `updateSession` after login,
+logout, account switch and startup navigation. Its resolver must retrieve the
+owned message and validate the live catalog destination through your backend's
+user-authenticated endpoint. It waits for the matching account and ready
+navigation, drops results after account switching, and calls `unavailable`
+when the target cannot be resolved. The SDK never executes purchases or
+redemptions and never trusts push parameters as authorization.
+
+`WhisperrInboxPage.fromJson` reads `{messages: [{id, title, body, created_at,
+action}], next_cursor}` from that same authenticated backend. Keep the history
+on the server so a missed push can still be recovered. Clear your rendered
+history and discard in-flight responses when the account changes. Publishable
+mobile ingestion keys must **not** be used to retrieve another user's history;
+server producer credentials stay on your backend.
