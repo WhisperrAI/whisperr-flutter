@@ -13,10 +13,3 @@ export 'src/persistence.dart'
 export 'src/whisperr_client.dart'
     show Whisperr, WhisperrClient, kWhisperrSdkVersion, kWhisperrDefaultBaseUrl;
 export 'src/whisperr_options.dart' show WhisperrOptions;
-export 'src/messages.dart'
-    show
-        WhisperrMessageAction,
-        WhisperrPushMessage,
-        WhisperrInboxMessage,
-        WhisperrInboxPage,
-        WhisperrActionCoordinator;

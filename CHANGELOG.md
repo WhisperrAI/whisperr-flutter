@@ -1,7 +1,6 @@
-## 0.4.0
+## Unreleased
 
-- Add versioned catalog discovery actions, namespaced push and authenticated inbox models.
-- Add a host-supplied action coordinator for startup/login deferral, recipient isolation, server resolution and unavailable-target fallback.
+- Add optional `reset(flushBeforeReset: false)` to clear local identity without waiting for network delivery during logout. Default reset behavior is unchanged.
 
 # Changelog
 
