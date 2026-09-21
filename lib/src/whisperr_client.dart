@@ -320,14 +320,18 @@ class WhisperrClient {
   /// Clears the current user (e.g. on logout) after flushing pending work.
   /// Also clears the persisted identity and last-sent push-token pair, so the
   /// next user's `setPushToken` re-registers the device.
-  Future<void> reset() async {
-    await flush();
+  /// Set [flushBeforeReset] to false for interactive logout: clear identity
+  /// locally while queued operations retain their original user and drain in
+  /// the background. An offline transport cannot delay the next login.
+  Future<void> reset({bool flushBeforeReset = true}) async {
+    if (flushBeforeReset) await flush();
     _currentUserId = null;
     _pendingPushToken = null;
     _lastPushToken = null;
     _lastPushUserId = null;
     await _persistIdentity();
     await _persistPushState();
+    if (!flushBeforeReset) unawaited(flush());
   }
 
   /// Flushes, stops timers, and releases resources. The instance is unusable

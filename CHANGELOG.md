@@ -1,3 +1,7 @@
+## Unreleased
+
+- Add optional `reset(flushBeforeReset: false)` to clear local identity without waiting for network delivery during logout. Default reset behavior is unchanged.
+
 # Changelog
 
 ## 0.3.2
