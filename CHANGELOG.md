@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4
+
+- Fix event loss when the bounded queue overflows during an in-flight request.
+  Identify and batch acknowledgments now remove only the original operation IDs.
+  Permanent errors cannot drop newer queued work or clear a replacement push
+  registration's deduplication mark after the original request was evicted.
+
 ## 0.3.3
 
 - Add optional `reset(flushBeforeReset: false)` to clear local identity without waiting for network delivery during logout. Default reset behavior is unchanged.

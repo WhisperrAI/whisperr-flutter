@@ -12,7 +12,7 @@ import 'persistence.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.3.3';
+const String kWhisperrSdkVersion = '0.3.4';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
@@ -428,7 +428,7 @@ class WhisperrClient {
       try {
         if (head.kind == WhisperrOpKind.identify) {
           await _api.identify(head.body);
-          _queue.removeAt(0);
+          _removeQueuedOps([head]);
           await _persist();
         } else {
           final batch = <WhisperrQueueOp>[];
@@ -439,7 +439,7 @@ class WhisperrClient {
           }
           final result =
               await _api.trackBatch(batch.map((o) => o.body).toList());
-          _queue.removeRange(0, batch.length);
+          _removeQueuedOps(batch);
           await _persist();
           if (result.rejected > 0) {
             _emit('dropped',
@@ -454,8 +454,11 @@ class WhisperrClient {
           _emit('dropped', 'dropped op after permanent client error',
               status: e.statusCode);
           _log('dropping op after permanent client error ($e)');
-          await _forgetPushMark([head]); // registration rejected — let it re-send
-          _queue.removeAt(0);
+          // Overflow may already have evicted this request and cleared its
+          // push mark. Do not clear a newer registration's mark a second time.
+          final discarded = _queue.where((op) => op.id == head.id).toList();
+          await _forgetPushMark(discarded);
+          _removeQueuedOps(discarded);
           await _persist();
           continue;
         }
@@ -477,6 +480,13 @@ class WhisperrClient {
         await Future<void>.delayed(_backoff(attempt));
       }
     }
+  }
+
+  // Capacity eviction can move the queue while HTTP is pending. A response
+  // applies only to the operations actually sent, never their former indexes.
+  void _removeQueuedOps(Iterable<WhisperrQueueOp> completed) {
+    final ids = completed.map((op) => op.id).toSet();
+    _queue.removeWhere((op) => ids.contains(op.id));
   }
 
   Future<void> _enqueue(WhisperrQueueOp op) async {
