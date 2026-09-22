@@ -33,7 +33,7 @@ Future<List<dynamic>> persistedQueue(WhisperrPersistence store) async =>
 void main() {
   for (final status in [200, 400]) {
     for (final nextUser in ['new-user', 'old-user']) {
-      test('evicted identify $status cannot remove $nextUser replacement work',
+      test('protected identify $status cannot remove $nextUser replacement work',
           () async {
         final nextToken = nextUser == 'old-user' ? 'old-token' : 'new-token';
         final started = Completer<void>();
@@ -79,7 +79,7 @@ void main() {
             .where((body) => body['event_type'] != null)
             .toList();
         expect(expectedEvents.map((body) => body['event_type']),
-            ['old_event_2', 'old_event_3']);
+            ['old_event_3']);
 
         response.complete(http.Response('{}', status));
         await client.flush();

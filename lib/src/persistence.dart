@@ -40,7 +40,9 @@ class SharedPreferencesPersistence implements WhisperrPersistence {
   @override
   Future<void> save(String slot, String data) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_key(slot), data);
+    if (!await prefs.setString(_key(slot), data)) {
+      throw StateError('Whisperr persistence write failed');
+    }
   }
 
   @override

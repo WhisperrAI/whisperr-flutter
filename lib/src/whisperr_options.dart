@@ -28,8 +28,9 @@ class WhisperrOptions {
   /// Max events per `/v1/events/batch` request. The backend hard-caps at 500.
   final int maxBatchSize;
 
-  /// Hard cap on the persisted queue. When exceeded, the oldest ops are dropped
-  /// (and logged) to bound disk/memory use.
+  /// Hard cap on the persisted queue. Oldest telemetry events are dropped first.
+  /// Identify operations are protected; if they fill the queue, new identifies
+  /// reject and incoming telemetry is dropped.
   final int maxQueueSize;
 
   /// Max consecutive retry attempts for a transient failure before backing off
