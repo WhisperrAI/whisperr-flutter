@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.5
+
+- Add `identify(requirePersistence: true)` to reject channel transitions when local queue storage fails or persistence is disabled.
+- Protect identify operations from telemetry overflow. A queue containing only identifies rejects additional identifies instead of losing pending changes.
+- Serialize queue updates and persistence writes, including delivery acknowledgments, to prevent stale storage snapshots.
+- Treat unsuccessful SharedPreferences writes as storage errors.
+
 ## 0.3.4
 
 - Fix event loss when the bounded queue overflows during an in-flight request.

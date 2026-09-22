@@ -124,3 +124,17 @@ await Whisperr.instance.flush(); // force delivery (e.g. before a critical await
 ## A note on the API key
 
 The ingestion key is embedded in your app, like a Segment write key or Amplitude API key. It can only ingest events for your app; treat it as publishable, not secret.
+
+### Durable channel changes
+
+For logout/token revocations that your application journals, use
+`identify(userId, channels: [...], requirePersistence: true)`. Clear the journal
+only after the call succeeds. A successful call confirms that the configured
+persistence implementation saved the queue; it does not confirm network delivery
+or server acceptance. Disabled persistence, storage failure, and a queue filled
+with identify operations reject the call so the application can retain its journal
+and retry. Invalid server requests can still be rejected permanently.
+
+Queue capacity remains bounded. Telemetry events may be evicted; pending identify
+operations are protected. Normal `identify()` calls also reject when all queue
+slots contain identifies. Token stream forwarding catches and reports these errors.

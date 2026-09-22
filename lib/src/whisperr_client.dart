@@ -12,7 +12,7 @@ import 'persistence.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.3.4';
+const String kWhisperrSdkVersion = '0.3.5';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
@@ -52,6 +52,8 @@ class WhisperrClient {
   final Map<String, Object?> Function() _deviceTraits;
 
   final List<WhisperrQueueOp> _queue = [];
+  Future<void> _queueTail = Future.value();
+  Future<void> _identityTail = Future.value();
   String? _currentUserId;
   /// Token captured before identify(); attached to the next identify.
   /// Memory-only by design: FCM/APNs re-deliver the token on every launch.
@@ -120,7 +122,10 @@ class WhisperrClient {
   /// offset fallback. See [defaultDeviceTraits].
   ///
   /// Enqueued durably and flushed in order; returns once buffered (call [flush]
-  /// to await delivery).
+  /// to await delivery). For channel revocations, set [requirePersistence] to
+  /// reject the call if the queue cannot be saved. Success confirms local
+  /// persistence, not server acceptance. Identify operations are never evicted
+  /// for capacity: a queue full of identifies rejects another identify.
   Future<void> identify(
     String externalUserId, {
     Map<String, dynamic>? traits,
@@ -129,12 +134,33 @@ class WhisperrClient {
     String? pushToken,
     String? preferredChannel,
     List<WhisperrChannel>? channels,
+    bool requirePersistence = false,
+  }) => _mutateIdentity(() => _identify(externalUserId,
+      traits: traits, email: email, phone: phone, pushToken: pushToken,
+      preferredChannel: preferredChannel, channels: channels,
+      requirePersistence: requirePersistence));
+
+  Future<void> _identify(
+    String externalUserId, {
+    Map<String, dynamic>? traits,
+    String? email,
+    String? phone,
+    String? pushToken,
+    String? preferredChannel,
+    List<WhisperrChannel>? channels,
+    bool requirePersistence = false,
   }) async {
     _ensureUsable();
+    if (requirePersistence && !_options.enablePersistence) {
+      throw StateError('identify requires enabled persistence');
+    }
     final id = externalUserId.trim();
     if (id.isEmpty) {
       throw ArgumentError.value(
-          externalUserId, 'externalUserId', 'must not be empty');
+        externalUserId,
+        'externalUserId',
+        'must not be empty',
+      );
     }
     _currentUserId = id;
     await _persistIdentity();
@@ -163,19 +189,19 @@ class WhisperrClient {
     // pushToken: or an explicit push channel) isn't stranded opted-in.
     WhisperrChannel? newPush;
     for (final c in resolved) {
-      if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) newPush = c;
+      if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) {
+        newPush = c;
+      }
     }
     final lastForUser = _lastPushUserId == id ? _lastPushToken : null;
     if (newPush != null &&
         lastForUser != null &&
         lastForUser != newPush.address &&
-        !resolved.any((c) =>
-            c.type == WhisperrChannelType.push && c.address == lastForUser)) {
+        !resolved.any(
+          (c) => c.type == WhisperrChannelType.push && c.address == lastForUser,
+        )) {
       resolved.insert(0, WhisperrChannel.push(lastForUser, optedIn: false));
     }
-    await _rememberPushChannel(id, resolved);
-    _pendingPushToken = null;
-
     final body = <String, dynamic>{'external_user_id': id};
     final mergedTraits = _withDeviceTraits(traits);
     if (mergedTraits.isNotEmpty) body['traits'] = mergedTraits;
@@ -186,8 +212,14 @@ class WhisperrClient {
       body['channels'] = resolved.map((c) => c.toJson()).toList();
     }
 
-    await _enqueue(WhisperrQueueOp(
-        id: _nextId(), kind: WhisperrOpKind.identify, body: body));
+    await _enqueue(
+      WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: body),
+      requirePersistence: requirePersistence,
+      afterAccepted: () async {
+        await _rememberPushChannel(id, resolved);
+        _pendingPushToken = null;
+      },
+    );
     unawaited(flush());
   }
 
@@ -199,7 +231,10 @@ class WhisperrClient {
   /// so this holds across app restarts too (safe to wire to `onTokenRefresh`
   /// or call on every launch). Called before [identify], the token is buffered
   /// in memory and attached to the next identify.
-  Future<void> setPushToken(String token) async {
+  Future<void> setPushToken(String token) =>
+      _mutateIdentity(() => _setPushToken(token));
+
+  Future<void> _setPushToken(String token) async {
     _ensureUsable();
     final t = token.trim();
     // An empty / whitespace token is silently ignored: getToken() can return an
@@ -222,14 +257,16 @@ class WhisperrClient {
       'external_user_id': uid,
       'channels': channels.map((c) => c.toJson()).toList(),
     };
-    // Mark the last-sent pair BEFORE enqueue so an overflow-evicted registration
-    // clears the mark (mark-on-delivery), never stranding a token opted-out.
-    _lastPushUserId = uid;
-    _lastPushToken = t;
-    await _persistPushState();
-    _pendingPushToken = null;
+    // Remember only accepted registrations. Rejected storage/capacity changes
+    // must remain retryable on the next token refresh.
     await _enqueue(WhisperrQueueOp(
-        id: _nextId(), kind: WhisperrOpKind.identify, body: body));
+        id: _nextId(), kind: WhisperrOpKind.identify, body: body),
+        afterAccepted: () async {
+          _lastPushUserId = uid;
+          _lastPushToken = t;
+          await _persistPushState();
+          _pendingPushToken = null;
+        });
     unawaited(flush());
   }
 
@@ -323,7 +360,10 @@ class WhisperrClient {
   /// Set [flushBeforeReset] to false for interactive logout: clear identity
   /// locally while queued operations retain their original user and drain in
   /// the background. An offline transport cannot delay the next login.
-  Future<void> reset({bool flushBeforeReset = true}) async {
+  Future<void> reset({bool flushBeforeReset = true}) =>
+      _mutateIdentity(() => _reset(flushBeforeReset: flushBeforeReset));
+
+  Future<void> _reset({required bool flushBeforeReset}) async {
     if (flushBeforeReset) await flush();
     _currentUserId = null;
     _pendingPushToken = null;
@@ -402,16 +442,37 @@ class WhisperrClient {
     final token = _lastPushToken;
     final user = _lastPushUserId;
     if (token == null || user == null) return;
+    final discardedIds = discarded.map((op) => op.id).toSet();
+    if (_queue.any((op) {
+      if (discardedIds.contains(op.id) ||
+          op.kind != WhisperrOpKind.identify ||
+          op.body['external_user_id'] != user) {
+        return false;
+      }
+      final channels = op.body['channels'];
+      return channels is List &&
+          channels.any(
+            (c) =>
+                c is Map &&
+                c['channel'] == 'push' &&
+                c['address'] == token &&
+                (c['opted_in'] == null || c['opted_in'] == true),
+          );
+    })) {
+      return;
+    }
     for (final op in discarded) {
       if (op.kind != WhisperrOpKind.identify) continue;
       if (op.body['external_user_id'] != user) continue;
       final channels = op.body['channels'];
       if (channels is! List) continue;
-      final carried = channels.any((c) =>
-          c is Map &&
-          c['channel'] == 'push' &&
-          c['address'] == token &&
-          (c['opted_in'] == null || c['opted_in'] == true));
+      final carried = channels.any(
+        (c) =>
+            c is Map &&
+            c['channel'] == 'push' &&
+            c['address'] == token &&
+            (c['opted_in'] == null || c['opted_in'] == true),
+      );
       if (carried) {
         _lastPushUserId = null;
         _lastPushToken = null;
@@ -428,8 +489,7 @@ class WhisperrClient {
       try {
         if (head.kind == WhisperrOpKind.identify) {
           await _api.identify(head.body);
-          _removeQueuedOps([head]);
-          await _persist();
+          await _removeQueuedOps([head]);
         } else {
           final batch = <WhisperrQueueOp>[];
           for (final op in _queue) {
@@ -439,8 +499,7 @@ class WhisperrClient {
           }
           final result =
               await _api.trackBatch(batch.map((o) => o.body).toList());
-          _removeQueuedOps(batch);
-          await _persist();
+          await _removeQueuedOps(batch);
           if (result.rejected > 0) {
             _emit('dropped',
                 'batch delivered with ${result.rejected} rejected event(s)');
@@ -458,8 +517,7 @@ class WhisperrClient {
           // push mark. Do not clear a newer registration's mark a second time.
           final discarded = _queue.where((op) => op.id == head.id).toList();
           await _forgetPushMark(discarded);
-          _removeQueuedOps(discarded);
-          await _persist();
+          await _removeQueuedOps(discarded);
           continue;
         }
         if (e.isAuthError) {
@@ -484,25 +542,63 @@ class WhisperrClient {
 
   // Capacity eviction can move the queue while HTTP is pending. A response
   // applies only to the operations actually sent, never their former indexes.
-  void _removeQueuedOps(Iterable<WhisperrQueueOp> completed) {
-    final ids = completed.map((op) => op.id).toSet();
-    _queue.removeWhere((op) => ids.contains(op.id));
+  // Resolve rotation against the last accepted control, not a concurrent
+  // request's stale token snapshot. Reset shares this lane too.
+  Future<void> _mutateIdentity(Future<void> Function() change) {
+    final result = _identityTail.then((_) => change());
+    _identityTail = result.catchError((Object _) {});
+    return result;
   }
 
-  Future<void> _enqueue(WhisperrQueueOp op) async {
-    _queue.add(op);
-    if (_queue.length > _options.maxQueueSize) {
-      final overflow = _queue.length - _options.maxQueueSize;
-      final evicted = _queue.sublist(0, overflow);
-      _queue.removeRange(0, overflow);
-      await _forgetPushMark(evicted); // an evicted registration never shipped
-      _emit('dropped',
-          'queue exceeded ${_options.maxQueueSize}; dropped $overflow oldest op(s)');
-      _log(
-          'queue exceeded ${_options.maxQueueSize}; dropped $overflow oldest op(s)');
-    }
-    await _persist();
+  Future<void> _mutateQueue(Future<void> Function() change) {
+    final result = _queueTail.then((_) => change());
+    // A failed strict write rejects its caller without poisoning later work.
+    _queueTail = result.catchError((Object _) {});
+    return result;
   }
+
+  Future<void> _removeQueuedOps(Iterable<WhisperrQueueOp> completed) {
+    final ids = completed.map((op) => op.id).toSet();
+    return _mutateQueue(() async {
+      final next = _queue.where((op) => !ids.contains(op.id)).toList();
+      await _persistQueue(next);
+      _queue
+        ..clear()
+        ..addAll(next);
+    });
+  }
+
+  Future<void> _enqueue(
+    WhisperrQueueOp op, {
+    bool requirePersistence = false,
+    Future<void> Function()? afterAccepted,
+  }) => _mutateQueue(() async {
+    final next = [..._queue, op];
+    var dropped = 0;
+    while (next.length > _options.maxQueueSize) {
+      final event = next.indexWhere(
+        (entry) => entry.kind == WhisperrOpKind.track,
+      );
+      if (event == -1) {
+        throw StateError(
+          'Whisperr queue is full of pending identify operations',
+        );
+      }
+      next.removeAt(event);
+      dropped++;
+    }
+    await _persistQueue(next, requirePersistence: requirePersistence);
+    _queue
+      ..clear()
+      ..addAll(next);
+    await afterAccepted?.call();
+    if (dropped > 0) {
+      _emit(
+        'dropped',
+        'queue exceeded ${_options.maxQueueSize}; dropped $dropped telemetry event(s)',
+      );
+    }
+  });
 
   Future<void> _restore() async {
     try {
@@ -548,12 +644,20 @@ class WhisperrClient {
     }
   }
 
-  Future<void> _persist() async {
+  Future<void> _persistQueue(
+    List<WhisperrQueueOp> queue, {
+    bool requirePersistence = false,
+  }) async {
     try {
-      await _persistence.save(WhisperrPersistence.queueSlot,
-          jsonEncode(_queue.map((o) => o.toJson()).toList()));
-    } catch (e) {
-      _log('failed to persist queue ($e)');
+      await _persistence.save(
+        WhisperrPersistence.queueSlot,
+        jsonEncode(queue.map((o) => o.toJson()).toList()),
+      );
+    } catch (_) {
+      _emit('persistence', 'failed to persist queue');
+      if (requirePersistence) {
+        throw StateError('Whisperr could not persist the identify operation');
+      }
     }
   }
 
