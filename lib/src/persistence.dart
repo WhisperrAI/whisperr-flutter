@@ -3,7 +3,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// Storage seam for the SDK's durable state. Injectable so the engine stays
 /// testable without Flutter platform plugins.
 ///
-/// State lives in named slots ([queueSlot], [identitySlot], [pushSlot]), each
+/// State lives in named slots ([queueSlot], [identitySlot], [pushSlot],
+/// [anonymousSlot], [appSlot], [optOutSlot], [pushOpenedSlot]), each
 /// holding a single string blob. Implementations decide how slots map to
 /// underlying storage keys.
 abstract class WhisperrPersistence {
@@ -18,6 +19,20 @@ abstract class WhisperrPersistence {
   /// `getToken()` wiring stays a no-op across restarts and a post-restart
   /// rotation can still opt the stale token out.
   static const String pushSlot = 'push';
+
+  /// The device's anonymous handle (`anonymous_id`) for events sent before
+  /// identify(). Rotated by reset().
+  static const String anonymousSlot = 'anonymous';
+
+  /// The app version and build seen on the last launch; drives
+  /// `app_installed` / `app_updated`.
+  static const String appSlot = 'app';
+
+  /// The persisted opt-out flag set by `setOptOut`.
+  static const String optOutSlot = 'opt_out';
+
+  /// Recent `whisperr_message_id`s already reported as `push_opened`.
+  static const String pushOpenedSlot = 'push_opened';
 
   Future<String?> load(String slot);
   Future<void> save(String slot, String data);

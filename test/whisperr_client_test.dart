@@ -9,6 +9,7 @@ import 'package:whisperr/whisperr.dart';
 
 const _fastOptions = WhisperrOptions(
   flushOnLifecyclePause: false,
+  trackAutomaticEvents: false,
   retryBaseDelay: Duration(milliseconds: 1),
   maxRetryDelay: Duration(milliseconds: 5),
   maxRetries: 2,
@@ -143,13 +144,25 @@ void main() {
     expect(client.pendingCount, 0);
   });
 
-  test('track without a user throws', () async {
-    final mock = MockClient((req) async => http.Response('{}', 202));
+  test('track without a user is sent under the anonymous id, never throws',
+      () async {
+    final requests = <http.Request>[];
+    final mock = MockClient((req) async {
+      requests.add(req);
+      return http.Response('{"accepted":1,"rejected":0}', 202);
+    });
     final client = buildClient(mock);
     addTearDown(client.close);
     await client.start();
 
-    expect(() => client.track('opened_app'), throwsStateError);
+    await client.track('opened_app');
+    await client.flush();
+
+    final event = ((jsonDecode(requests.single.body) as Map)['events'] as List)
+        .single as Map;
+    expect(event.containsKey('external_user_id'), isFalse);
+    expect(event['anonymous_id'], client.anonymousId);
+    expect(client.anonymousId, isNotNull);
   });
 
   test('invalid event_type is dropped before it can poison a batch', () async {
@@ -163,6 +176,7 @@ void main() {
       mock,
       options: WhisperrOptions(
         flushOnLifecyclePause: false,
+        trackAutomaticEvents: false,
         retryBaseDelay: const Duration(milliseconds: 1),
         maxRetryDelay: const Duration(milliseconds: 5),
         maxRetries: 2,
@@ -253,7 +267,10 @@ void main() {
     });
     final client = buildClient(
       mock,
-      options: const WhisperrOptions(flushAt: 3, flushOnLifecyclePause: false),
+      options: const WhisperrOptions(
+          flushAt: 3,
+          flushOnLifecyclePause: false,
+          trackAutomaticEvents: false),
     );
     addTearDown(client.close);
     await client.start();

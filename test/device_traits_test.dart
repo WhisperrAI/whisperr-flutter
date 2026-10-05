@@ -9,6 +9,7 @@ import 'package:whisperr/whisperr.dart';
 
 const _fastOptions = WhisperrOptions(
   flushOnLifecyclePause: false,
+  trackAutomaticEvents: false,
   retryBaseDelay: Duration(milliseconds: 1),
   maxRetryDelay: Duration(milliseconds: 5),
   maxRetries: 2,

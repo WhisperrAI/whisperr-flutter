@@ -13,6 +13,7 @@ class WhisperrOptions {
     this.requestTimeout = const Duration(seconds: 30),
     this.enablePersistence = true,
     this.flushOnLifecyclePause = true,
+    this.trackAutomaticEvents = true,
     this.debug = false,
     this.onError,
   })  : assert(flushAt > 0),
@@ -49,8 +50,17 @@ class WhisperrOptions {
   /// Persist the queue across app restarts (via shared_preferences).
   final bool enablePersistence;
 
-  /// Flush when the app is paused/detached (recommended on mobile).
+  /// Flush when the app goes to the background (hidden/paused) or is
+  /// detached (recommended on mobile).
   final bool flushOnLifecyclePause;
+
+  /// Send the automatic app events: `app_installed`, `app_updated`,
+  /// `app_opened` and `app_backgrounded`. Each carries `app_version`,
+  /// `app_build`, `os_name`, `os_version`, `platform`, `locale` and the
+  /// timezone the platform can provide. Install and update are detected from
+  /// a persisted "last seen version", so they need [enablePersistence].
+  /// Set to false to send only the events you track yourself.
+  final bool trackAutomaticEvents;
 
   /// Emit verbose logs via `debugPrint`.
   final bool debug;

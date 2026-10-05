@@ -15,12 +15,15 @@ topics:
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
-  flutter: ">=3.16.0"
+  flutter: ">=3.19.0"
 
 dependencies:
   flutter:
     sdk: flutter
   http: ^1.2.0
+  # App version/build for automatic events. Wide range so host apps keep
+  # their own pin (8.x, 9.x or 10.x all expose the same PackageInfo API).
+  package_info_plus: ">=8.0.0 <11.0.0"
   shared_preferences: ^2.2.0
 
 dev_dependencies:

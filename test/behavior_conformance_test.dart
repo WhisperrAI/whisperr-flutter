@@ -46,6 +46,7 @@ WhisperrClient _client(
     options: WhisperrOptions(
       flushInterval: const Duration(hours: 1),
       flushOnLifecyclePause: false,
+      trackAutomaticEvents: false,
       retryBaseDelay: const Duration(milliseconds: 1),
       maxRetryDelay: const Duration(milliseconds: 5),
       maxRetries: maxRetries,

@@ -39,6 +39,7 @@ WhisperrClient _client(MockClient mock, WhisperrPersistence persistence) {
     persistence: persistence,
     options: const WhisperrOptions(
       flushOnLifecyclePause: false,
+      trackAutomaticEvents: false,
       retryBaseDelay: Duration(milliseconds: 1),
       maxRetryDelay: Duration(milliseconds: 5),
       maxRetries: 2,

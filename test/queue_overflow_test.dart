@@ -22,6 +22,7 @@ WhisperrClient overflowClient(
       maxBatchSize: 3,
       maxQueueSize: 3,
       flushOnLifecyclePause: false,
+      trackAutomaticEvents: false,
     ),
     deviceTraits: () => {},
   );

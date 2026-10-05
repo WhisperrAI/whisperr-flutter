@@ -45,6 +45,7 @@ WhisperrClient makeClient(WhisperrPersistence persistence,
           maxQueueSize: capacity,
           enablePersistence: enabled,
           flushOnLifecyclePause: false,
+          trackAutomaticEvents: false,
           flushInterval: const Duration(hours: 1)),
       deviceTraits: () => {},
     );

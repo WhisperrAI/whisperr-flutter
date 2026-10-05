@@ -35,6 +35,7 @@ WhisperrClient _client(MockClient mock, {DateTime? clock}) {
     persistence: InMemoryPersistence(),
     options: const WhisperrOptions(
       flushOnLifecyclePause: false,
+      trackAutomaticEvents: false,
       retryBaseDelay: Duration(milliseconds: 1),
       maxRetryDelay: Duration(milliseconds: 5),
       maxRetries: 2,
