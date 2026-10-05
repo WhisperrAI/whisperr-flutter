@@ -1,0 +1,28 @@
+name: whisperr_firebase_messaging
+description: Firebase Cloud Messaging for the Whisperr Flutter SDK — push token, permission state and notification-open tracking with deep links in a few calls.
+version: 0.1.0
+homepage: https://github.com/WhisperrAI/whisperr-flutter/tree/main/packages/whisperr_firebase_messaging
+repository: https://github.com/WhisperrAI/whisperr-flutter
+issue_tracker: https://github.com/WhisperrAI/whisperr-flutter/issues
+
+topics:
+  - push-notifications
+  - firebase
+  - churn
+  - analytics
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  firebase_messaging: ">=15.1.0 <17.0.0"
+  whisperr: ^0.5.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  http: ^1.2.0

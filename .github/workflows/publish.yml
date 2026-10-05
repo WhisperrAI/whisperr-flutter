@@ -29,4 +29,8 @@ jobs:
           channel: stable
           cache: true
       - run: flutter pub get
+      # packages/ holds other packages (whisperr_firebase_messaging), published
+      # by their own workflows. A root .pubignore cannot exclude them: pub also
+      # applies it to the nested package and hides its files there.
+      - run: rm -rf packages
       - run: dart pub publish --force

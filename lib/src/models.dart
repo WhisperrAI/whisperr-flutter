@@ -9,6 +9,108 @@ enum WhisperrChannelType {
   String get wireValue => name;
 }
 
+/// The type of a push token. It tells the server which provider can send to
+/// the token (SPEC.md → Token kind).
+enum WhisperrPushTokenKind {
+  /// A Firebase Cloud Messaging registration token.
+  fcm('fcm'),
+
+  /// A raw APNs device token (hex).
+  apns('apns'),
+
+  /// An Expo push token (`ExponentPushToken[…]`).
+  expo('expo'),
+
+  /// A OneSignal subscription id.
+  oneSignalSubscription('onesignal_sub');
+
+  const WhisperrPushTokenKind(this.wireValue);
+
+  /// The value sent as `kind`.
+  final String wireValue;
+}
+
+/// The APNs environment of an `apns` token. Development-signed builds get
+/// `sandbox` tokens; TestFlight and App Store builds get `production` tokens.
+enum WhisperrPushEnvironment {
+  production,
+  sandbox;
+
+  /// The value sent as `push_env`.
+  String get wireValue => name;
+}
+
+/// The notification permission the OS reports for this app.
+enum WhisperrPushPermission {
+  /// Notifications show.
+  granted,
+
+  /// iOS quiet delivery: notifications go to Notification Center only.
+  provisional,
+
+  /// The user turned notifications off.
+  denied,
+
+  /// The app has not asked yet.
+  undetermined;
+
+  /// The value sent as the `push_permission` trait.
+  String get wireValue => name;
+
+  /// Whether the OS shows (or quietly delivers) notifications.
+  bool get allowsPush => this == granted || this == provisional;
+
+  /// Parses a [wireValue]; null for anything else.
+  static WhisperrPushPermission? fromWire(Object? value) {
+    for (final p in values) {
+      if (p.wireValue == value) return p;
+    }
+    return null;
+  }
+}
+
+/// A tap on a Whisperr push: the message id and the deep link, if any.
+class WhisperrPushOpen {
+  const WhisperrPushOpen({required this.messageId, this.deepLink});
+
+  /// Reads `whisperr_message_id` and the deep link (`whisperr_deep_link`, or
+  /// `deep_link`) from a push data payload. Null for a push that did not come
+  /// from Whisperr.
+  static WhisperrPushOpen? fromData(Map<String, dynamic> data) {
+    final id = _text(data['whisperr_message_id']);
+    if (id == null) return null;
+    return WhisperrPushOpen(
+      messageId: id,
+      deepLink: _text(data['whisperr_deep_link']) ?? _text(data['deep_link']),
+    );
+  }
+
+  /// The `whisperr_message_id` from the push data.
+  final String messageId;
+
+  /// The deep link from the push data, or null.
+  final String? deepLink;
+
+  static String? _text(Object? value) {
+    if (value is! String && value is! num) return null;
+    final text = value.toString().trim();
+    return text.isEmpty ? null : text;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is WhisperrPushOpen &&
+      other.messageId == messageId &&
+      other.deepLink == deepLink;
+
+  @override
+  int get hashCode => Object.hash(messageId, deepLink);
+
+  @override
+  String toString() =>
+      'WhisperrPushOpen(messageId: $messageId, deepLink: $deepLink)';
+}
+
 /// A reachable contact address for a user on a given channel.
 class WhisperrChannel {
   const WhisperrChannel({
@@ -16,6 +118,9 @@ class WhisperrChannel {
     required this.address,
     this.verified,
     this.optedIn,
+    this.kind,
+    this.platform,
+    this.pushEnv,
   });
 
   /// Convenience constructor for an email channel.
@@ -36,26 +141,52 @@ class WhisperrChannel {
           verified: verified,
           optedIn: optedIn);
 
-  /// Convenience constructor for a push token channel.
+  /// Convenience constructor for a push token channel. [kind], [platform]
+  /// and [pushEnv] are optional token metadata; send only what you know.
   factory WhisperrChannel.push(String address,
-          {bool? verified, bool? optedIn}) =>
+          {bool? verified,
+          bool? optedIn,
+          WhisperrPushTokenKind? kind,
+          String? platform,
+          WhisperrPushEnvironment? pushEnv}) =>
       WhisperrChannel(
           type: WhisperrChannelType.push,
           address: address,
           verified: verified,
-          optedIn: optedIn);
+          optedIn: optedIn,
+          kind: kind,
+          platform: platform,
+          pushEnv: pushEnv);
 
   final WhisperrChannelType type;
   final String address;
   final bool? verified;
   final bool? optedIn;
 
-  Map<String, dynamic> toJson() => {
-        'channel': type.wireValue,
-        'address': address,
-        if (verified != null) 'verified': verified,
-        if (optedIn != null) 'opted_in': optedIn,
-      };
+  /// Push only: the token type, sent as `kind`.
+  final WhisperrPushTokenKind? kind;
+
+  /// Push only: the OS family (`ios`, `android`, …), sent as `platform`.
+  final String? platform;
+
+  /// Push only: the APNs environment, sent as `push_env`.
+  final WhisperrPushEnvironment? pushEnv;
+
+  Map<String, dynamic> toJson() {
+    // Token metadata goes only on an opted-in push entry; an opt-out is
+    // matched by address alone.
+    final meta = type == WhisperrChannelType.push && optedIn != false;
+    final os = platform?.trim();
+    return {
+      'channel': type.wireValue,
+      'address': address,
+      if (verified != null) 'verified': verified,
+      if (optedIn != null) 'opted_in': optedIn,
+      if (meta && kind != null) 'kind': kind!.wireValue,
+      if (meta && os != null && os.isNotEmpty) 'platform': os,
+      if (meta && pushEnv != null) 'push_env': pushEnv!.wireValue,
+    };
+  }
 }
 
 /// Delivery problem surfaced by the SDK after it classifies a backend/network

@@ -1,0 +1,12 @@
+# The path override is for development in this repo only.
+pubspec_overrides.yaml
+.dart_tool/
+.packages
+build/
+pubspec.lock
+.flutter-plugins
+.flutter-plugins-dependencies
+doc/api/
+*.iml
+.idea/
+.vscode/

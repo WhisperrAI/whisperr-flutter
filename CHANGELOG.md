@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **Push token kinds** (whisperr-spec `push.json` `kindCases`):
+  `setPushToken(token, kind:, platform:, pushEnv:)` and
+  `attachPushTokenStream(stream, kind:, …)`. New enums
+  `WhisperrPushTokenKind` and `WhisperrPushEnvironment`. With any metadata,
+  `platform` defaults to the device OS and an Expo token gets `kind: expo`;
+  `pushEnv` is never guessed. A bare token is unchanged on the wire. A token
+  re-sent with new metadata goes out once more; a bare token never removes
+  metadata already sent. `WhisperrChannel.push` takes the same fields.
+- **`setPushPermission(WhisperrPushPermission)`**: sends the trait
+  `push_permission`, deduped across restarts. `denied` opts out this device's
+  token and holds it until the permission comes back. Before login, the status
+  goes with the next `identify()`.
+- **Deep links:** `trackPushOpened` reads `whisperr_deep_link`, then
+  `deep_link`. New `WhisperrPushOpen.fromData(data)` returns the message id and
+  deep link for routing.
+- **New package
+  [`whisperr_firebase_messaging`](packages/whisperr_firebase_messaging/README.md)**:
+  `registerFirebaseMessaging`, `handleRemoteMessage`, `handleNotificationOpens`.
+
 ## 0.4.0
 
 This is a minor release because automatic events are on by default. Apps
