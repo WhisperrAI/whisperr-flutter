@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 - **Push token kinds** (whisperr-spec `push.json` `kindCases`):
   `setPushToken(token, kind:, platform:, pushEnv:)` and
