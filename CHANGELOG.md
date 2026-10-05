@@ -1,33 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
-- **Automatic app events, on by default.** `app_installed`, `app_updated`
-  (with `previous_version` / `previous_build`), `app_opened` (`cold_start`) and
-  `app_backgrounded` (`foreground_ms`). Every SDK-generated event carries
-  `sdk_name` (`whisperr-flutter`), `sdk_version`, `app_version`, `app_build`,
-  `platform` and `os_name` (the OS family: `ios`, `android`, `web`),
-  `os_version` (iOS, macOS, Windows), `locale` and `timezone_offset_minutes`
-  (plus `timezone` only when it is a real IANA name). Turn them off with `WhisperrOptions(trackAutomaticEvents: false)`.
-  Install and update come from a persisted "last seen version"; an app that
-  already has SDK state from an older version records its version silently
-  instead of sending `app_installed`.
-- New `screen(name)` sends `screen_viewed` with `screen_name`.
-- **Events before identify (anonymous lane).** `track()` no longer throws
-  without a user. It sends the event under a persisted `anonymous_id` (UUID
-  v4). The next `identify()` carries the same `anonymous_id`, so the server
-  merges those events into the user. `reset()` rotates it. Passes
-  whisperr-spec `conformance/anonymous.json`.
-- New `trackPushOpened(data)` sends `push_opened` with `whisperr_message_id`
-  (and `deep_link` when present) for Whisperr pushes. Repeat calls for the same
-  message id are ignored, also across restarts.
-- New `setOptOut(bool)` / `isOptedOut`. Opting out deletes the queue and stops
-  all sending. The choice is persisted.
-- Honor `Retry-After` on `429` / `503` (seconds or HTTP-date, capped at 60 s)
-  instead of the computed backoff. The retry limit is unchanged.
-- Flush also when the app becomes hidden, not only on pause/detach.
-- New dependency: `package_info_plus` (`>=8.0.0 <11.0.0`) for the app version
-  and build. Minimum Flutter is now 3.19.
+This is a minor release because automatic events are on by default. Apps
+pinned to `^0.3.x` do not get them until they move to `^0.4.0`.
+
+- **Automatic app events, on by default.** The SDK sends `app_installed`,
+  `app_updated`, `app_opened` and `app_backgrounded`. Each SDK event carries
+  the SDK name and version, the app version and build, the platform, the OS,
+  the locale and the time zone. New `screen(name)` sends `screen_viewed`.
+- **Off switch.** Set `WhisperrOptions(trackAutomaticEvents: false)` to turn
+  automatic events off.
+- **Events before identify (anonymous lane).** `track()` no longer throws when
+  there is no user. It sends the event under a saved `anonymous_id`. The next
+  `identify()` carries the same id, so the server merges those events into the
+  user. `reset()` makes a new id.
+- **Push opens.** New `trackPushOpened(data)` sends `push_opened` for Whisperr
+  pushes. It sends each message only once, also after a restart.
+- **Opt-out.** New `setOptOut(bool)` and `isOptedOut`. Opt-out deletes the
+  queue and stops all sending. The SDK saves the choice.
+- **Retry-After.** On `429` and `503`, the SDK waits for the time in
+  `Retry-After` (at most 60 s). The retry limit does not change.
+- **Email is not marked verified by default.** The `email:` shortcut on
+  `identify()` sends no `verified` field. The server decides. To set it, build
+  `channels` yourself.
+- The SDK also flushes when the app becomes hidden.
+- **New dependency: `package_info_plus`** (`>=8.0.0 <11.0.0`). The SDK uses it
+  to read the app version and build.
+- **Minimum Flutter is now 3.19.**
 
 ## 0.3.5
 
