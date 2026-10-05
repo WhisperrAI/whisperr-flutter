@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
 
 import 'api_client.dart';
+import 'app_context.dart';
 import 'device_traits.dart';
 import 'models.dart';
 import 'persistence.dart';
@@ -19,6 +20,10 @@ const String kWhisperrSdkVersion = '0.3.5';
 const String kWhisperrDefaultBaseUrl = 'https://api.whisperr.net';
 
 final _eventTypePattern = RegExp(r'^[a-z0-9]+(?:_[a-z0-9]+)*$');
+
+/// How many reported `whisperr_message_id`s [WhisperrClient.trackPushOpened]
+/// remembers for dedupe.
+const int _maxRememberedPushOpens = 50;
 
 /// The Whisperr engine: an ordered, durable outbound queue that delivers
 /// identify and track calls to the runtime API with batching, retry, and
@@ -35,21 +40,32 @@ class WhisperrClient {
     DateTime Function()? clock,
     Random? random,
     Map<String, Object?> Function()? deviceTraits,
+    Future<Map<String, Object?>> Function()? appContext,
   })  : _api = apiClient,
         _persistence = persistence,
         _options = options,
         _clock = clock ?? (() => DateTime.now().toUtc()),
         _random = random ?? Random(),
-        _deviceTraits = deviceTraits ?? defaultDeviceTraits;
+        _idRandom = random ?? _secureRandom(),
+        _deviceTraits = deviceTraits ?? defaultDeviceTraits,
+        _appContextResolver = appContext ?? defaultAppContext;
 
   final WhisperrApiClient _api;
   final WhisperrPersistence _persistence;
   final WhisperrOptions _options;
   final DateTime Function() _clock;
   final Random _random;
+  /// Source for the anonymous handle: a secure generator unless a test pins
+  /// [random].
+  final Random _idRandom;
   /// Resolves the reserved identify trait defaults (see [defaultDeviceTraits]);
-  /// injectable so tests can pin or silence them.
+  /// injectable so tests can pin or silence them. Also supplies `locale` and
+  /// the timezone on SDK-generated events.
   final Map<String, Object?> Function() _deviceTraits;
+  /// Resolves the static app/OS context for SDK-generated events (see
+  /// [defaultAppContext]); injectable so tests can pin it.
+  final Future<Map<String, Object?>> Function() _appContextResolver;
+  Map<String, Object?> _appContext = const {};
 
   final List<WhisperrQueueOp> _queue = [];
   Future<void> _queueTail = Future.value();
@@ -69,6 +85,17 @@ class WhisperrClient {
   /// Push-token stream subscriptions opened by [attachPushTokenStream];
   /// cancelled on [close] so late token emissions can't reach a dead client.
   final List<StreamSubscription<String>> _pushSubscriptions = [];
+  /// The device's anonymous handle. Created on the first event sent before
+  /// identify(), persisted, carried on identify() (which promotes it), and
+  /// rotated by reset().
+  String? _anonymousId;
+  bool _optedOut = false;
+  /// Recent `whisperr_message_id`s already sent as `push_opened`.
+  final List<String> _pushOpened = [];
+  /// Lifecycle bookkeeping for `app_opened` / `app_backgrounded`.
+  bool _inBackground = false;
+  bool _coldOpenPending = false;
+  DateTime? _foregroundSince;
   bool _started = false;
   bool _closed = false;
   int _seq = 0;
@@ -77,41 +104,84 @@ class WhisperrClient {
   /// on [start], so it survives app restarts.
   String? get currentUserId => _currentUserId;
 
+  /// The anonymous handle (`anonymous_id`) this device sends events under
+  /// before [identify], or null if none was needed yet. Rotated by [reset].
+  String? get anonymousId => _anonymousId;
+
+  /// Whether [setOptOut] stopped all sending. Persisted across restarts.
+  bool get isOptedOut => _optedOut;
+
   /// Number of operations currently buffered (visible for tests/diagnostics).
   @visibleForTesting
   int get pendingCount => _queue.length;
 
-  /// Loads persisted state (queue, identity, last-sent push token), starts the
-  /// periodic flusher, and (on Flutter) attaches an app-lifecycle flush.
+  /// Loads persisted state (queue, identity, last-sent push token, anonymous
+  /// handle, opt-out), starts the periodic flusher, attaches the app-lifecycle
+  /// observer (background flush and automatic events), and sends the launch's
+  /// automatic events (`app_installed` / `app_updated`, `app_opened`).
   Future<void> start() async {
     if (_started) return;
     _started = true;
 
-    await _restore();
+    final hadPriorState = await _restore();
 
     _timer = Timer.periodic(_options.flushInterval, (_) => unawaited(flush()));
 
-    if (_options.flushOnLifecyclePause) {
+    if (_options.flushOnLifecyclePause || _options.trackAutomaticEvents) {
       try {
-        _lifecycle = AppLifecycleListener(
-          onPause: () => unawaited(flush()),
-          onDetach: () => unawaited(flush()),
-        );
+        _lifecycle = AppLifecycleListener(onStateChange: handleLifecycleState);
       } catch (_) {
-        // No Flutter binding (e.g. pure-Dart test) — lifecycle flush is optional.
+        // No Flutter binding (e.g. pure-Dart test) — lifecycle hooks are optional.
       }
+    }
+
+    // Resolved once per launch; screen() and trackPushOpened() use it too.
+    try {
+      _appContext = Map<String, Object?>.of(await _appContextResolver());
+    } catch (e) {
+      _log('app context unavailable ($e)');
+    }
+
+    if (_options.trackAutomaticEvents) {
+      await _trackLaunch(hadPriorState: hadPriorState);
     }
 
     if (_queue.isNotEmpty) unawaited(flush());
   }
 
+  /// Applies an app-lifecycle transition. Called by the SDK's own
+  /// [AppLifecycleListener]; public only so tests can drive it.
+  ///
+  /// - hidden / paused: sends `app_backgrounded` once per background visit
+  ///   (with `foreground_ms`), then flushes.
+  /// - resumed after a background visit: sends `app_opened` with
+  ///   `cold_start: false` (or `true` if the process started in background).
+  /// - detached: flushes.
+  @visibleForTesting
+  void handleLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+        unawaited(_guard(_enterBackground));
+      case AppLifecycleState.resumed:
+        unawaited(_guard(_enterForeground));
+      case AppLifecycleState.detached:
+        if (_options.flushOnLifecyclePause) unawaited(flush());
+      case AppLifecycleState.inactive:
+        break;
+    }
+  }
+
   /// Identifies the current user and persists their traits and contact channels.
   ///
   /// Sets [currentUserId] so subsequent [track] calls attribute to this user.
+  /// If this device already sent events under an [anonymousId], the identify
+  /// carries it so the server merges those events into this user.
   ///
   /// Pass [email] / [phone] / [pushToken] for the common case; they expand into
-  /// opted-in channels. For consent or verification control (opt-out, verified
-  /// flags, multiple addresses) build [channels] explicitly. Whisperr decides
+  /// opted-in channels with no `verified` field (the server decides). For
+  /// consent or verification control (opt-out, verified flags, multiple
+  /// addresses) build [channels] explicitly. Whisperr decides
   /// which channel to actually use, so there is no "preferred channel" to set.
   ///
   /// The reserved traits `locale` (BCP 47, from the platform locale) and
@@ -164,6 +234,9 @@ class WhisperrClient {
     }
     _currentUserId = id;
     await _persistIdentity();
+    // Opted out: keep the identity locally (so opting back in attributes
+    // correctly) but send nothing.
+    if (_optedOut) return;
 
     final resolved = <WhisperrChannel>[
       if (email != null && email.trim().isNotEmpty)
@@ -203,6 +276,10 @@ class WhisperrClient {
       resolved.insert(0, WhisperrChannel.push(lastForUser, optedIn: false));
     }
     final body = <String, dynamic>{'external_user_id': id};
+    // Carrying the handle is what makes the server promote this device's
+    // anonymous events into the identified user (SPEC.md → Anonymous visitors).
+    final anonymousId = _anonymousId;
+    if (anonymousId != null) body['anonymous_id'] = anonymousId;
     final mergedTraits = _withDeviceTraits(traits);
     if (mergedTraits.isNotEmpty) body['traits'] = mergedTraits;
     if (preferredChannel != null && preferredChannel.trim().isNotEmpty) {
@@ -231,11 +308,17 @@ class WhisperrClient {
   /// so this holds across app restarts too (safe to wire to `onTokenRefresh`
   /// or call on every launch). Called before [identify], the token is buffered
   /// in memory and attached to the next identify.
+  ///
+  /// The token is sent opted in, so call this only while the OS reports
+  /// notification permission (authorized or provisional). When the user turns
+  /// notifications off, opt the token out explicitly:
+  /// `identify(userId, channels: [WhisperrChannel.push(token, optedIn: false)])`.
   Future<void> setPushToken(String token) =>
       _mutateIdentity(() => _setPushToken(token));
 
   Future<void> _setPushToken(String token) async {
     _ensureUsable();
+    if (_optedOut) return;
     final t = token.trim();
     // An empty / whitespace token is silently ignored: getToken() can return an
     // empty string before the device has registered, and this is documented as
@@ -304,6 +387,9 @@ class WhisperrClient {
   /// [eventType] should be snake_case (the backend rejects other shapes).
   /// Buffered and delivered in batches; the event's timestamp is captured now
   /// so offline events keep their real time when later flushed.
+  ///
+  /// Before [identify] the event is sent under this device's [anonymousId];
+  /// the next identify merges it into the user. A no-op while opted out.
   Future<void> track(
     String eventType, {
     Map<String, dynamic>? properties,
@@ -311,11 +397,11 @@ class WhisperrClient {
     String? userId,
   }) async {
     _ensureUsable();
-    final uid = (userId ?? _currentUserId)?.trim();
-    if (uid == null || uid.isEmpty) {
-      throw StateError(
-          'track() requires a user: call identify() first or pass userId.');
-    }
+    if (_optedOut) return;
+    final explicit = userId?.trim();
+    final uid = explicit != null && explicit.isNotEmpty
+        ? explicit
+        : _currentUserId?.trim();
     final type = eventType.trim();
     if (type.isEmpty) {
       throw ArgumentError.value(eventType, 'eventType', 'must not be empty');
@@ -334,7 +420,11 @@ class WhisperrClient {
       r'$message_id': messageId,
     };
     final body = <String, dynamic>{
-      'external_user_id': uid,
+      // One id is required: the user's once known, else the device handle.
+      if (uid != null && uid.isNotEmpty)
+        'external_user_id': uid
+      else
+        'anonymous_id': _ensureAnonymousId(),
       'event_type': type,
       'occurred_at': _occurredAtIso(),
       'properties': properties ?? <String, dynamic>{},
@@ -347,16 +437,93 @@ class WhisperrClient {
     if (_queue.length >= _options.flushAt) unawaited(flush());
   }
 
+  /// Records a screen view: sends `screen_viewed` with `screen_name` and the
+  /// app/OS context. Call it from your router or a `NavigatorObserver`. An
+  /// empty name is ignored. Works before identify (anonymous lane).
+  Future<void> screen(
+    String screenName, {
+    Map<String, dynamic>? properties,
+  }) async {
+    final name = screenName.trim();
+    if (name.isEmpty) return;
+    await _trackSdkEvent('screen_viewed', {
+      ...?properties,
+      'screen_name': name,
+    });
+  }
+
+  /// Reports a tap on a push notification. Pass the push data payload (for
+  /// `firebase_messaging`: `RemoteMessage.data`) from both
+  /// `FirebaseMessaging.onMessageOpenedApp` and `getInitialMessage()`.
+  ///
+  /// When [data] carries `whisperr_message_id` (Whisperr stamps it on every
+  /// push it sends), this sends `push_opened` with `whisperr_message_id` and,
+  /// if present, `deep_link`, and returns true. Other pushes are ignored and
+  /// return false. A message id already reported is ignored too (the last 50
+  /// ids are remembered across restarts), so calling it from both hooks is
+  /// safe.
+  Future<bool> trackPushOpened(Map<String, dynamic> data) async {
+    _ensureUsable();
+    if (_optedOut) return false;
+    final raw = data['whisperr_message_id'];
+    final id = raw == null ? '' : raw.toString().trim();
+    if (id.isEmpty || _pushOpened.contains(id)) return false;
+    // Mark before any await so a concurrent call for the same id is a no-op.
+    _pushOpened.add(id);
+    while (_pushOpened.length > _maxRememberedPushOpens) {
+      _pushOpened.removeAt(0);
+    }
+    await _persistPushOpened();
+    final link = data['deep_link'];
+    final deepLink = link is String ? link.trim() : '';
+    await _trackSdkEvent('push_opened', {
+      'whisperr_message_id': id,
+      if (deepLink.isNotEmpty) 'deep_link': deepLink,
+    });
+    unawaited(flush());
+    return true;
+  }
+
+  /// Opts this device out of (or back into) Whisperr. Opting out stops all
+  /// sending at once: queued events and identifies are deleted, and later
+  /// [track], [identify], [setPushToken], [screen], [trackPushOpened] and
+  /// automatic events send nothing. [identify] still records the user id
+  /// locally, so opting back in attributes new events correctly. The choice
+  /// is persisted across restarts. Nothing is sent to the server about the
+  /// choice itself.
+  Future<void> setOptOut(bool optOut) async {
+    _ensureUsable();
+    if (_optedOut == optOut) return;
+    _optedOut = optOut;
+    try {
+      if (optOut) {
+        await _persistence.save(WhisperrPersistence.optOutSlot, '1');
+      } else {
+        await _persistence.clear(WhisperrPersistence.optOutSlot);
+      }
+    } catch (e) {
+      _emit('persistence', 'failed to persist opt-out');
+      _log('failed to persist opt-out ($e)');
+    }
+    if (!optOut) return;
+    _pendingPushToken = null;
+    await _mutateQueue(() async {
+      await _persistQueue(const []);
+      _queue.clear();
+    });
+  }
+
   /// Forces a flush and completes when the drain pass finishes (whether it
   /// emptied the queue or stopped on a transient/auth error).
   Future<void> flush() {
-    if (_closed || _queue.isEmpty) return Future.value();
+    if (_closed || _optedOut || _queue.isEmpty) return Future.value();
     return _flushing ??= _drain().whenComplete(() => _flushing = null);
   }
 
   /// Clears the current user (e.g. on logout) after flushing pending work.
   /// Also clears the persisted identity and last-sent push-token pair, so the
-  /// next user's `setPushToken` re-registers the device.
+  /// next user's `setPushToken` re-registers the device, and rotates the
+  /// [anonymousId], so the next person on this device is a new visitor.
   /// Set [flushBeforeReset] to false for interactive logout: clear identity
   /// locally while queued operations retain their original user and drain in
   /// the background. An offline transport cannot delay the next login.
@@ -369,8 +536,10 @@ class WhisperrClient {
     _pendingPushToken = null;
     _lastPushToken = null;
     _lastPushUserId = null;
+    _anonymousId = null;
     await _persistIdentity();
     await _persistPushState();
+    await _persistAnonymousId();
     if (!flushBeforeReset) unawaited(flush());
   }
 
@@ -391,6 +560,167 @@ class WhisperrClient {
   }
 
   // --- internals ---
+
+  /// The launch's automatic events: `app_installed` on the first launch,
+  /// `app_updated` when the version or build changed, then `app_opened`.
+  Future<void> _trackLaunch({required bool hadPriorState}) async {
+    try {
+      await _trackInstallOrUpdate(hadPriorState: hadPriorState);
+    } catch (e) {
+      _log('install/update detection failed ($e)');
+    }
+    // A process started in the background (e.g. by a push) is not an open:
+    // report the cold start when the app first comes to the foreground.
+    final state = _currentLifecycleState();
+    if (state == AppLifecycleState.hidden || state == AppLifecycleState.paused) {
+      _inBackground = true;
+      _coldOpenPending = true;
+      return;
+    }
+    _foregroundSince = _clock();
+    await _guard(() => _trackSdkEvent('app_opened', {'cold_start': true}));
+  }
+
+  Future<void> _trackInstallOrUpdate({required bool hadPriorState}) async {
+    // Without durable storage every launch would look like an install.
+    if (!_options.enablePersistence) return;
+    final version = _appContext['app_version'];
+    final build = _appContext['app_build'];
+    Map<String, dynamic>? previous;
+    final raw = await _persistence.load(WhisperrPersistence.appSlot);
+    if (raw != null && raw.isNotEmpty) {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) previous = Map<String, dynamic>.from(decoded);
+    }
+    if (previous == null) {
+      // State from an older SDK version means the app was installed before
+      // this SDK learned to detect installs: record the version silently.
+      if (!hadPriorState) {
+        await _trackSdkEvent('app_installed', {
+          if (version != null) 'app_version': version,
+          if (build != null) 'app_build': build,
+        });
+      }
+    } else if (version != null &&
+        previous['version'] != null &&
+        (previous['version'] != version || previous['build'] != build)) {
+      await _trackSdkEvent('app_updated', {
+        'app_version': version,
+        if (build != null) 'app_build': build,
+        if (previous['version'] != null) 'previous_version': previous['version'],
+        if (previous['build'] != null) 'previous_build': previous['build'],
+      });
+    }
+    if (previous == null || version != null) {
+      await _persistence.save(WhisperrPersistence.appSlot,
+          jsonEncode({'version': version, 'build': build}));
+    }
+  }
+
+  Future<void> _enterBackground() async {
+    if (!_inBackground) {
+      _inBackground = true;
+      final since = _foregroundSince;
+      _foregroundSince = null;
+      if (_options.trackAutomaticEvents) {
+        await _trackSdkEvent('app_backgrounded', {
+          if (since != null)
+            'foreground_ms': max(0, _clock().difference(since).inMilliseconds),
+        });
+      }
+    }
+    if (_options.flushOnLifecyclePause) await flush();
+  }
+
+  Future<void> _enterForeground() async {
+    if (!_inBackground) return;
+    _inBackground = false;
+    _foregroundSince = _clock();
+    final cold = _coldOpenPending;
+    _coldOpenPending = false;
+    if (_options.trackAutomaticEvents) {
+      await _trackSdkEvent('app_opened', {'cold_start': cold});
+    }
+  }
+
+  /// Tracks an SDK-named event with the app/OS context merged under its own
+  /// properties. Never throws for a closed client: lifecycle callbacks can
+  /// race [close].
+  Future<void> _trackSdkEvent(String type, Map<String, dynamic> properties) {
+    if (_closed || _optedOut) return Future.value();
+    return track(type, properties: {..._automaticProperties(), ...properties});
+  }
+
+  /// `sdk_name`, `sdk_version`, `app_version`, `app_build`, `os_name`,
+  /// `os_version`, `platform` (resolved once per launch) plus the current
+  /// `locale` and `timezone_offset_minutes` / IANA `timezone`.
+  Map<String, dynamic> _automaticProperties() {
+    final out = <String, dynamic>{
+      'sdk_name': kWhisperrSdkName,
+      'sdk_version': kWhisperrSdkVersion,
+    };
+    _appContext.forEach((k, v) {
+      if (v != null) out[k] = v;
+    });
+    _resolveDeviceTraits().forEach((k, v) {
+      if (v != null) out[k] = v;
+    });
+    // `timezone` only as a real IANA name; otherwise the offset stands in.
+    if (out.containsKey('timezone') && !isIanaTimezone(out['timezone'])) {
+      out.remove('timezone');
+    }
+    return out;
+  }
+
+  AppLifecycleState? _currentLifecycleState() {
+    try {
+      return WidgetsBinding.instance.lifecycleState;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _guard(Future<void> Function() action) async {
+    try {
+      await action();
+    } catch (e) {
+      _log('automatic event failed ($e)');
+    }
+  }
+
+  /// The anonymous handle, created (a UUID v4) on first use. Synchronous so
+  /// un-awaited track() calls keep their order; the save is issued before the
+  /// event's own queue write, so storage sees the handle first.
+  String _ensureAnonymousId() {
+    final existing = _anonymousId;
+    if (existing != null) return existing;
+    final id = _uuidV4(_idRandom);
+    _anonymousId = id;
+    unawaited(_persistAnonymousId());
+    return id;
+  }
+
+  Future<void> _persistAnonymousId() async {
+    try {
+      final id = _anonymousId;
+      if (id == null) {
+        await _persistence.clear(WhisperrPersistence.anonymousSlot);
+      } else {
+        await _persistence.save(WhisperrPersistence.anonymousSlot, id);
+      }
+    } catch (e) {
+      _log('failed to persist anonymous id ($e)');
+    }
+  }
+
+  Future<void> _persistPushOpened() async {
+    try {
+      await _persistence.save(
+          WhisperrPersistence.pushOpenedSlot, jsonEncode(_pushOpened));
+    } catch (e) {
+      _log('failed to persist push-opened ids ($e)');
+    }
+  }
 
   /// Trait keys the engine reads for the user's zone. Any of them supplied by
   /// the caller means "don't default a timezone" (nor the offset fallback).
@@ -484,7 +814,7 @@ class WhisperrClient {
 
   Future<void> _drain() async {
     var attempt = 0;
-    while (_queue.isNotEmpty && !_closed) {
+    while (_queue.isNotEmpty && !_closed && !_optedOut) {
       final head = _queue.first;
       try {
         if (head.kind == WhisperrOpKind.identify) {
@@ -535,7 +865,9 @@ class WhisperrClient {
               'transient failures exhausted retries; will retry on next flush ($e)');
           return;
         }
-        await Future<void>.delayed(_backoff(attempt));
+        // A 429/503 Retry-After (capped at 60 s) replaces the computed
+        // backoff; it never resets or extends the retry limit.
+        await Future<void>.delayed(e.retryAfter ?? _backoff(attempt));
       }
     }
   }
@@ -573,6 +905,8 @@ class WhisperrClient {
     bool requirePersistence = false,
     Future<void> Function()? afterAccepted,
   }) => _mutateQueue(() async {
+    // An op that raced setOptOut(true) past its entry check is discarded.
+    if (_optedOut) return;
     final next = [..._queue, op];
     var dropped = 0;
     while (next.length > _options.maxQueueSize) {
@@ -600,7 +934,9 @@ class WhisperrClient {
     }
   });
 
-  Future<void> _restore() async {
+  /// Restores persisted state. Returns whether any state from an earlier
+  /// launch existed (queue, identity, push pair or anonymous handle).
+  Future<bool> _restore() async {
     try {
       final raw = await _persistence.load(WhisperrPersistence.queueSlot);
       if (raw != null && raw.isNotEmpty) {
@@ -642,6 +978,36 @@ class WhisperrClient {
     } catch (e) {
       _log('failed to restore persisted push state ($e)');
     }
+    try {
+      final raw = await _persistence.load(WhisperrPersistence.anonymousSlot);
+      if (raw != null && raw.trim().isNotEmpty) _anonymousId = raw.trim();
+    } catch (e) {
+      _log('failed to restore anonymous id ($e)');
+    }
+    try {
+      final raw = await _persistence.load(WhisperrPersistence.optOutSlot);
+      _optedOut = raw == '1';
+    } catch (e) {
+      _log('failed to restore opt-out ($e)');
+    }
+    try {
+      final raw = await _persistence.load(WhisperrPersistence.pushOpenedSlot);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is List) _pushOpened.addAll(decoded.whereType<String>());
+      }
+    } catch (e) {
+      _log('failed to restore push-opened ids ($e)');
+    }
+    if (_optedOut && _queue.isNotEmpty) {
+      // Opted out while a queue write was racing: never send it.
+      _queue.clear();
+      await _persistQueue(const []);
+    }
+    return _queue.isNotEmpty ||
+        _currentUserId != null ||
+        _lastPushToken != null ||
+        _anonymousId != null;
   }
 
   Future<void> _persistQueue(
@@ -697,6 +1063,24 @@ class WhisperrClient {
     final capped = exp.clamp(0, maxMs);
     final jitter = (_random.nextDouble() * 0.3 * capped).round();
     return Duration(milliseconds: capped + jitter);
+  }
+
+  static Random _secureRandom() {
+    try {
+      return Random.secure();
+    } catch (_) {
+      return Random();
+    }
+  }
+
+  /// RFC 4122 version-4 UUID (the spec's `anonymous_id` format).
+  static String _uuidV4(Random r) {
+    final bytes = List<int>.generate(16, (_) => r.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+        '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
   }
 
   String _nextId() =>

@@ -6,7 +6,7 @@ Identify your users and track product events so Whisperr can decide and deliver 
 
 ```yaml
 dependencies:
-  whisperr: ^0.3.0
+  whisperr: ^0.3.5
 ```
 
 ## Initialize
@@ -80,6 +80,21 @@ final sub = Whisperr.instance.attachPushTokenStream(messaging.onTokenRefresh);
   user's other devices are never touched.
 - After `reset()` (logout), call `setPushToken` again once the next user logs
   in.
+- Call `setPushToken` only while the OS reports notification permission. The
+  token is sent opted in.
+
+Report push taps, so Whisperr learns which messages work:
+
+```dart
+FirebaseMessaging.onMessageOpenedApp
+    .listen((m) => Whisperr.instance.trackPushOpened(m.data));
+final initial = await FirebaseMessaging.instance.getInitialMessage();
+if (initial != null) await Whisperr.instance.trackPushOpened(initial.data);
+```
+
+`trackPushOpened` sends `push_opened` only for Whisperr pushes (the data has
+`whisperr_message_id`). It ignores a message id it already reported, so calling
+it from both hooks is safe.
 
 ## Track
 
@@ -91,17 +106,57 @@ Whisperr.instance.track('checkout_completed', properties: {'amount': 42, 'curren
 
 > Event names must be `snake_case`. Only events that map to the events you configured during onboarding drive interventions; others are accepted but inert.
 
+You can call `track()` before `identify()`. The SDK sends the event under a
+device `anonymous_id`. The next `identify()` carries the same id, so Whisperr
+merges those events into the user. `reset()` starts a new anonymous id.
+
+## Automatic events
+
+The SDK sends these events for you. You write no code.
+
+| Event | When | Own properties |
+| --- | --- | --- |
+| `app_installed` | first launch | `app_version`, `app_build` |
+| `app_updated` | first launch of a new version or build | `app_version`, `app_build`, `previous_version`, `previous_build` |
+| `app_opened` | launch, and each return from background | `cold_start` |
+| `app_backgrounded` | the app leaves the screen | `foreground_ms` |
+
+Every SDK-generated event (also `screen_viewed` and `push_opened`) carries
+`sdk_name` (`whisperr-flutter`), `sdk_version`, `app_version`, `app_build`,
+`platform` and `os_name` (the OS family: `ios`, `android`, `web`), `os_version`,
+`locale` and `timezone_offset_minutes`. `timezone` is sent only when it is a
+real IANA name. Flutter cannot read the IANA zone without a plugin, so most
+apps get the offset only. A key the platform cannot provide is
+left out (for example `os_version` on Android). Turn the automatic events off
+with `WhisperrOptions(trackAutomaticEvents: false)`.
+
+Screen views are manual. Call `screen()` from your router or a
+`NavigatorObserver`:
+
+```dart
+Whisperr.instance.screen('Checkout');
+```
+
 ## Logout
 
 ```dart
 await Whisperr.instance.reset(flushBeforeReset: false); // clears identity locally; drains in background
 ```
 
+## Opt-out
+
+```dart
+await Whisperr.instance.setOptOut(true);  // deletes the queue, sends nothing
+await Whisperr.instance.setOptOut(false); // sends again
+```
+
+The choice is persisted across restarts.
+
 ## How delivery works
 
 - **Durable queue** — `identify` and `track` are appended to an ordered queue and delivered in order. `identify` calls hit `POST /v1/identify`; `track` calls are coalesced into `POST /v1/events/batch`.
-- **Batching** — flushes on an interval (`flushInterval`), when the buffer hits `flushAt`, on app pause/detach, or when you call `flush()`.
-- **Offline** — the queue is persisted (via `shared_preferences`) and survives app restarts. Transient failures (network, 429, 5xx) retry with exponential backoff; auth errors (401/403) pause delivery and keep the queue; permanent client errors (4xx) drop the offending item so the queue keeps moving.
+- **Batching** — flushes on an interval (`flushInterval`), when the buffer hits `flushAt`, when the app goes to the background (hidden/pause/detach), or when you call `flush()`.
+- **Offline** — the queue is persisted (via `shared_preferences`) and survives app restarts. Transient failures (network, 429, 5xx) retry with exponential backoff; a `Retry-After` on 429/503 replaces the backoff (capped at 60 s); auth errors (401/403) pause delivery and keep the queue; permanent client errors (4xx) drop the offending item so the queue keeps moving.
 
 ## Options
 
@@ -114,6 +169,7 @@ await Whisperr.initialize(
     maxBatchSize: 500,     // backend hard cap
     maxQueueSize: 1000,    // drops oldest beyond this
     enablePersistence: true,
+    trackAutomaticEvents: true, // app_installed / updated / opened / backgrounded
     debug: false,
   ),
 );
