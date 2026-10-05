@@ -7,7 +7,14 @@ library whisperr;
 export 'src/api_client.dart'
     show WhisperrApiException, WhisperrBatchResult, WhisperrApiClient;
 export 'src/models.dart'
-    show WhisperrChannel, WhisperrChannelType, WhisperrError;
+    show
+        WhisperrChannel,
+        WhisperrChannelType,
+        WhisperrError,
+        WhisperrPushEnvironment,
+        WhisperrPushOpen,
+        WhisperrPushPermission,
+        WhisperrPushTokenKind;
 export 'src/persistence.dart'
     show WhisperrPersistence, InMemoryPersistence, SharedPreferencesPersistence;
 export 'src/whisperr_client.dart'

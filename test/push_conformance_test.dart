@@ -57,51 +57,82 @@ void main() {
     final spec = await _loadSpec();
     final cases = (spec['cases'] as List).cast<Map<String, dynamic>>();
     expect(cases, isNotEmpty);
-
-    for (final c in cases) {
-      final identifies = <Map<String, dynamic>>[];
-      final mock = MockClient((req) async {
-        if (req.url.path == '/v1/identify') {
-          identifies.add(jsonDecode(req.body) as Map<String, dynamic>);
-        }
-        return http.Response(
-            '{"user":{"id":"u","external_id":"u","created":true}}', 200);
-      });
-      final persistence = InMemoryPersistence();
-      var client = _client(mock, persistence);
-      addTearDown(() => client.close());
-      await client.start();
-
-      for (final raw in c['steps'] as List) {
-        final step = raw as Map<String, dynamic>;
-        if (step.containsKey('restart')) {
-          // App relaunch: tear the client down and build a fresh instance on
-          // the SAME persistence — identity and last-sent token must restore.
-          await client.close();
-          client = _client(mock, persistence);
-          await client.start();
-          continue;
-        }
-        if (step.containsKey('reset')) {
-          await client.reset(); // logout: clears identity + last-sent pair
-          await client.flush();
-          continue;
-        }
-        if (step.containsKey('identify')) {
-          final s = Map<String, dynamic>.from(step['identify'] as Map);
-          await client.identify(
-            s['externalUserId'] as String,
-            traits: s['traits'] as Map<String, dynamic>?,
-            pushToken: s['pushToken'] as String?,
-          );
-        } else {
-          await client.setPushToken(step['setPushToken'] as String);
-        }
-        // Deliver each step before the next, so request order is pinned.
-        await client.flush();
-      }
-
-      expect(identifies, c['expectedBodies'], reason: c['name'] as String);
-    }
+    await _runCases(cases);
   });
+
+  test('push-token kind, platform and push_env (whisperr-spec kindCases)',
+      () async {
+    final spec = await _loadSpec();
+    final cases =
+        ((spec['kindCases'] as List?) ?? const []).cast<Map<String, dynamic>>();
+    expect(cases, isNotEmpty);
+    await _runCases(cases);
+  });
+}
+
+T? _byWire<T extends Enum>(
+    List<T> values, Object? wire, String Function(T) of) {
+  for (final v in values) {
+    if (of(v) == wire) return v;
+  }
+  return null;
+}
+
+Future<void> _runCases(List<Map<String, dynamic>> cases) async {
+  for (final c in cases) {
+    final identifies = <Map<String, dynamic>>[];
+    final mock = MockClient((req) async {
+      if (req.url.path == '/v1/identify') {
+        identifies.add(jsonDecode(req.body) as Map<String, dynamic>);
+      }
+      return http.Response(
+          '{"user":{"id":"u","external_id":"u","created":true}}', 200);
+    });
+    final persistence = InMemoryPersistence();
+    var client = _client(mock, persistence);
+    addTearDown(() => client.close());
+    await client.start();
+
+    for (final raw in c['steps'] as List) {
+      final step = raw as Map<String, dynamic>;
+      if (step.containsKey('restart')) {
+        // App relaunch: tear the client down and build a fresh instance on
+        // the SAME persistence — identity and last-sent token must restore.
+        await client.close();
+        client = _client(mock, persistence);
+        await client.start();
+        continue;
+      }
+      if (step.containsKey('reset')) {
+        await client.reset(); // logout: clears identity + last-sent pair
+        await client.flush();
+        continue;
+      }
+      if (step.containsKey('identify')) {
+        final s = Map<String, dynamic>.from(step['identify'] as Map);
+        await client.identify(
+          s['externalUserId'] as String,
+          traits: s['traits'] as Map<String, dynamic>?,
+          pushToken: s['pushToken'] as String?,
+        );
+      } else if (step['setPushToken'] is Map) {
+        // The object form: token metadata as named arguments.
+        final t = Map<String, dynamic>.from(step['setPushToken'] as Map);
+        await client.setPushToken(
+          t['token'] as String,
+          kind: _byWire(
+              WhisperrPushTokenKind.values, t['kind'], (k) => k.wireValue),
+          platform: t['platform'] as String?,
+          pushEnv: _byWire(
+              WhisperrPushEnvironment.values, t['pushEnv'], (e) => e.wireValue),
+        );
+      } else {
+        await client.setPushToken(step['setPushToken'] as String);
+      }
+      // Deliver each step before the next, so request order is pinned.
+      await client.flush();
+    }
+
+    expect(identifies, c['expectedBodies'], reason: c['name'] as String);
+  }
 }

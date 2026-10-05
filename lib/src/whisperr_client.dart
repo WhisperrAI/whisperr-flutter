@@ -13,13 +13,22 @@ import 'persistence.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.4.0';
+const String kWhisperrSdkVersion = '0.5.0';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
 const String kWhisperrDefaultBaseUrl = 'https://api.whisperr.net';
 
 final _eventTypePattern = RegExp(r'^[a-z0-9]+(?:_[a-z0-9]+)*$');
+
+/// The server's Expo rule: `ExponentPushToken[…]` or `ExpoPushToken[…]`.
+final _expoPushToken = RegExp(r'^(?:Exponent|Expo)PushToken\[[^\]]+\]$');
+
+/// The `platform` values the spec allows on a push entry.
+const _pushPlatforms = {'ios', 'android', 'web', 'macos', 'windows', 'linux'};
+
+/// The trait that carries the notification permission.
+const _permissionTrait = 'push_permission';
 
 /// How many reported `whisperr_message_id`s [WhisperrClient.trackPushOpened]
 /// remembers for dedupe.
@@ -71,14 +80,23 @@ class WhisperrClient {
   Future<void> _queueTail = Future.value();
   Future<void> _identityTail = Future.value();
   String? _currentUserId;
-  /// Token captured before identify(); attached to the next identify.
-  /// Memory-only by design: FCM/APNs re-deliver the token on every launch.
-  String? _pendingPushToken;
+  /// Token captured before identify() (attached to the next identify), or
+  /// held back while the reported permission is denied (sent when it comes
+  /// back). An opted-in push channel with its metadata. Memory-only by
+  /// design: FCM/APNs re-deliver the token on every launch.
+  WhisperrChannel? _pendingPushToken;
   /// Last push token delivered and for which user — dedups refresh storms and
   /// lets a rotation opt the previous token out. Persisted (and restored on
   /// start) so the dedupe survives app restarts.
   String? _lastPushToken;
   String? _lastPushUserId;
+  /// The token metadata last delivered with [_lastPushToken] (see
+  /// [_pushMeta]), so a token re-sent with new metadata is not deduped away.
+  String? _lastPushMeta;
+  /// The notification permission last reported through [setPushPermission],
+  /// and the user it was sent for. Persisted.
+  WhisperrPushPermission? _permission;
+  String? _permissionSentFor;
   Timer? _timer;
   Future<void>? _flushing;
   AppLifecycleListener? _lifecycle;
@@ -250,11 +268,13 @@ class WhisperrClient {
     // A token buffered by setPushToken() rides along unless the caller
     // supplied its own push channel — or the pair was already delivered
     // (e.g. restored after a restart), in which case re-sending is redundant.
-    final pending = _pendingPushToken;
+    // A token held back while notifications are denied stays held back.
+    final denied = _permission == WhisperrPushPermission.denied;
+    final pending = denied ? null : _pendingPushToken;
     if (pending != null &&
         !resolved.any((c) => c.type == WhisperrChannelType.push) &&
-        !(_lastPushUserId == id && _lastPushToken == pending)) {
-      resolved.add(WhisperrChannel.push(pending, optedIn: true));
+        !(_lastPushUserId == id && _lastPushToken == pending.address)) {
+      resolved.add(pending);
     }
     // Rotation: if this identify registers a push token that differs from the
     // last one we sent for this user, opt the old one out in the same body —
@@ -281,6 +301,13 @@ class WhisperrClient {
     final anonymousId = _anonymousId;
     if (anonymousId != null) body['anonymous_id'] = anonymousId;
     final mergedTraits = _withDeviceTraits(traits);
+    // The device's notification permission, once per user (the caller's
+    // value wins).
+    final permission = _permission;
+    final sendPermission = permission != null &&
+        _permissionSentFor != id &&
+        !mergedTraits.containsKey(_permissionTrait);
+    if (sendPermission) mergedTraits[_permissionTrait] = permission.wireValue;
     if (mergedTraits.isNotEmpty) body['traits'] = mergedTraits;
     if (preferredChannel != null && preferredChannel.trim().isNotEmpty) {
       body['preferred_channel'] = preferredChannel.trim();
@@ -294,13 +321,17 @@ class WhisperrClient {
       requirePersistence: requirePersistence,
       afterAccepted: () async {
         await _rememberPushChannel(id, resolved);
-        _pendingPushToken = null;
+        if (!denied) _pendingPushToken = null;
+        if (sendPermission) {
+          _permissionSentFor = id;
+          await _persistPermission();
+        }
       },
     );
     unawaited(flush());
   }
 
-  /// Captures the device push token (FCM registration token / hex APNs token).
+  /// Captures the device push token.
   ///
   /// With a known user this re-identifies the push channel immediately: a
   /// rotated token opts the previously sent one out, and setting the same
@@ -309,14 +340,37 @@ class WhisperrClient {
   /// or call on every launch). Called before [identify], the token is buffered
   /// in memory and attached to the next identify.
   ///
-  /// The token is sent opted in, so call this only while the OS reports
-  /// notification permission (authorized or provisional). When the user turns
-  /// notifications off, opt the token out explicitly:
-  /// `identify(userId, channels: [WhisperrChannel.push(token, optedIn: false)])`.
-  Future<void> setPushToken(String token) =>
-      _mutateIdentity(() => _setPushToken(token));
+  /// Token metadata (SPEC.md → Token kind) tells the server which provider
+  /// can send to the token. Send what you know:
+  ///
+  /// - [kind] — `fcm` for a `firebase_messaging` token, `apns` for a raw
+  ///   APNs token, `expo`, or `oneSignalSubscription`.
+  /// - [platform] — the OS family. When you pass any metadata it defaults to
+  ///   the OS the app runs on.
+  /// - [pushEnv] — APNs tokens only: `sandbox` for development-signed builds,
+  ///   `production` for TestFlight and the App Store. Never guessed.
+  ///
+  /// Without metadata the token is sent alone and the server infers the kind.
+  /// A token re-sent with new metadata goes out once more; a bare token never
+  /// removes metadata already sent.
+  ///
+  /// While the last reported permission ([setPushPermission]) is denied, the
+  /// token is held back and sent when the permission comes back.
+  Future<void> setPushToken(
+    String token, {
+    WhisperrPushTokenKind? kind,
+    String? platform,
+    WhisperrPushEnvironment? pushEnv,
+  }) =>
+      _mutateIdentity(() => _setPushToken(token,
+          kind: kind, platform: platform, pushEnv: pushEnv));
 
-  Future<void> _setPushToken(String token) async {
+  Future<void> _setPushToken(
+    String token, {
+    WhisperrPushTokenKind? kind,
+    String? platform,
+    WhisperrPushEnvironment? pushEnv,
+  }) async {
     _ensureUsable();
     if (_optedOut) return;
     final t = token.trim();
@@ -324,17 +378,24 @@ class WhisperrClient {
     // empty string before the device has registered, and this is documented as
     // safe to call on every launch, so it must be a no-op (not an error).
     if (t.isEmpty) return;
+    final channel = _pushRegistration(t,
+        kind: kind, platform: platform, pushEnv: pushEnv);
     final uid = _currentUserId;
-    if (uid == null) {
-      _pendingPushToken = t; // attached to the next identify()
+    if (uid == null || _permission == WhisperrPushPermission.denied) {
+      _pendingPushToken = channel; // the next identify() / allowed report
       return;
     }
     final last = _lastPushUserId == uid ? _lastPushToken : null;
-    if (last == t) return; // refresh storm — token unchanged
+    final meta = _pushMeta(channel);
+    // Refresh storm — token unchanged, and nothing new to say about it.
+    if (last == t && (meta.isEmpty || meta == (_lastPushMeta ?? ''))) {
+      _pendingPushToken = null;
+      return;
+    }
     final channels = <WhisperrChannel>[
       // Rotation: retire the token this client previously registered.
-      if (last != null) WhisperrChannel.push(last, optedIn: false),
-      WhisperrChannel.push(t, optedIn: true),
+      if (last != null && last != t) WhisperrChannel.push(last, optedIn: false),
+      channel,
     ];
     final body = <String, dynamic>{
       'external_user_id': uid,
@@ -347,10 +408,142 @@ class WhisperrClient {
         afterAccepted: () async {
           _lastPushUserId = uid;
           _lastPushToken = t;
+          _lastPushMeta = meta.isEmpty ? null : meta;
           await _persistPushState();
           _pendingPushToken = null;
         });
     unawaited(flush());
+  }
+
+  /// Reports the OS notification permission. Safe to call on every launch and
+  /// every return to the foreground: a repeated status is a no-op, also across
+  /// restarts.
+  ///
+  /// The status goes to the user as the trait `push_permission`. `denied`
+  /// also opts out the push token this client registered, so the engine stops
+  /// choosing push for this device; `granted` / `provisional` registers it
+  /// again. Before [identify], the status goes with the next identify.
+  Future<void> setPushPermission(WhisperrPushPermission status) =>
+      _mutateIdentity(() => _setPushPermission(status));
+
+  Future<void> _setPushPermission(WhisperrPushPermission status) async {
+    _ensureUsable();
+    if (_optedOut) return;
+    final changed = _permission != status;
+    final uid = _currentUserId;
+    if (uid == null) {
+      if (changed) {
+        _permission = status;
+        _permissionSentFor = null;
+        await _persistPermission();
+      }
+      return;
+    }
+    if (!changed && _permissionSentFor == uid) return;
+
+    final channels = <WhisperrChannel>[];
+    var optOut = false;
+    WhisperrChannel? register;
+    final last = _lastPushUserId == uid ? _lastPushToken : null;
+    if (status == WhisperrPushPermission.denied) {
+      if (last != null) {
+        // Stop push to this device; hold the token so it registers again as
+        // soon as the permission comes back.
+        channels.add(WhisperrChannel.push(last, optedIn: false));
+        _pendingPushToken ??= _registrationFromMeta(last, _lastPushMeta);
+        optOut = true;
+      }
+    } else if (status.allowsPush && _pendingPushToken != null) {
+      final reg = _pendingPushToken!;
+      if (last != null && last != reg.address) {
+        channels.add(WhisperrChannel.push(last, optedIn: false));
+      }
+      if (last != reg.address) {
+        channels.add(reg);
+        register = reg;
+      }
+    }
+    final body = <String, dynamic>{
+      'external_user_id': uid,
+      'traits': {_permissionTrait: status.wireValue},
+      if (channels.isNotEmpty)
+        'channels': channels.map((c) => c.toJson()).toList(),
+    };
+    await _enqueue(
+      WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: body),
+      afterAccepted: () async {
+        _permission = status;
+        _permissionSentFor = uid;
+        await _persistPermission();
+        if (optOut) {
+          _lastPushUserId = null;
+          _lastPushToken = null;
+          _lastPushMeta = null;
+          await _persistPushState();
+        }
+        final registered = register;
+        if (registered != null) {
+          final meta = _pushMeta(registered);
+          _lastPushUserId = uid;
+          _lastPushToken = registered.address;
+          _lastPushMeta = meta.isEmpty ? null : meta;
+          _pendingPushToken = null;
+          await _persistPushState();
+        } else if (status.allowsPush && last == _pendingPushToken?.address) {
+          _pendingPushToken = null; // already registered
+        }
+      },
+    );
+    unawaited(flush());
+  }
+
+  /// An opted-in push channel for [token] with the metadata the caller knows.
+  /// With any metadata, an Expo token gets `kind: expo` and the platform
+  /// defaults to this device's OS family.
+  WhisperrChannel _pushRegistration(
+    String token, {
+    WhisperrPushTokenKind? kind,
+    String? platform,
+    WhisperrPushEnvironment? pushEnv,
+  }) {
+    final hasMeta = kind != null || platform != null || pushEnv != null;
+    final explicit = platform?.trim().toLowerCase();
+    final os = explicit != null && _pushPlatforms.contains(explicit)
+        ? explicit
+        : (hasMeta ? osFamily() : null);
+    return WhisperrChannel.push(
+      token,
+      optedIn: true,
+      kind: kind ??
+          (hasMeta && _expoPushToken.hasMatch(token)
+              ? WhisperrPushTokenKind.expo
+              : null),
+      platform: os != null && _pushPlatforms.contains(os) ? os : null,
+      pushEnv: pushEnv,
+    );
+  }
+
+  /// A stable signature of a push channel's metadata ('' when it has none).
+  static String _pushMeta(WhisperrChannel c) {
+    if (c.kind == null && c.platform == null && c.pushEnv == null) return '';
+    return '${c.kind?.wireValue ?? ''}|${c.platform ?? ''}|'
+        '${c.pushEnv?.wireValue ?? ''}';
+  }
+
+  /// Rebuilds an opted-in registration from a [_pushMeta] signature.
+  static WhisperrChannel _registrationFromMeta(String token, String? meta) {
+    final parts = (meta ?? '').split('|');
+    String? at(int i) => i < parts.length && parts[i].isNotEmpty ? parts[i] : null;
+    WhisperrPushTokenKind? kind;
+    for (final k in WhisperrPushTokenKind.values) {
+      if (k.wireValue == at(0)) kind = k;
+    }
+    WhisperrPushEnvironment? env;
+    for (final e in WhisperrPushEnvironment.values) {
+      if (e.wireValue == at(2)) env = e;
+    }
+    return WhisperrChannel.push(token,
+        optedIn: true, kind: kind, platform: at(1), pushEnv: env);
   }
 
   /// Forwards every token a stream emits to [setPushToken]. Plugs directly
@@ -363,13 +556,23 @@ class WhisperrClient {
   ///
   /// The subscription is also tracked and cancelled by [close], so a token
   /// emitted after the client is torn down can never reach it.
-  StreamSubscription<String> attachPushTokenStream(Stream<String> tokens) {
+  ///
+  /// [kind], [platform] and [pushEnv] are passed to [setPushToken] for every
+  /// token, for example `kind: WhisperrPushTokenKind.fcm`.
+  StreamSubscription<String> attachPushTokenStream(
+    Stream<String> tokens, {
+    WhisperrPushTokenKind? kind,
+    String? platform,
+    WhisperrPushEnvironment? pushEnv,
+  }) {
     final sub = tokens.listen(
       (token) {
         // setPushToken is async and may reject (e.g. the client was closed
         // between emission and delivery). Guard it so a throw never escapes as
         // an uncaught zone error and crashes the app — report and move on.
-        unawaited(setPushToken(token).catchError((Object error) {
+        unawaited(setPushToken(token,
+                kind: kind, platform: platform, pushEnv: pushEnv)
+            .catchError((Object error) {
           _log('setPushToken from stream failed: $error');
         }));
       },
@@ -458,27 +661,28 @@ class WhisperrClient {
   ///
   /// When [data] carries `whisperr_message_id` (Whisperr stamps it on every
   /// push it sends), this sends `push_opened` with `whisperr_message_id` and,
-  /// if present, `deep_link`, and returns true. Other pushes are ignored and
-  /// return false. A message id already reported is ignored too (the last 50
-  /// ids are remembered across restarts), so calling it from both hooks is
-  /// safe.
+  /// if present, `deep_link` (read from `whisperr_deep_link`, else
+  /// `deep_link`), and returns true. Other pushes are ignored and return
+  /// false. A message id already reported is ignored too (the last 50 ids are
+  /// remembered across restarts), so calling it from both hooks is safe.
+  ///
+  /// To route the tap, read the deep link with [WhisperrPushOpen.fromData].
   Future<bool> trackPushOpened(Map<String, dynamic> data) async {
     _ensureUsable();
     if (_optedOut) return false;
-    final raw = data['whisperr_message_id'];
-    final id = raw == null ? '' : raw.toString().trim();
-    if (id.isEmpty || _pushOpened.contains(id)) return false;
+    final open = WhisperrPushOpen.fromData(data);
+    if (open == null || _pushOpened.contains(open.messageId)) return false;
+    final id = open.messageId;
     // Mark before any await so a concurrent call for the same id is a no-op.
     _pushOpened.add(id);
     while (_pushOpened.length > _maxRememberedPushOpens) {
       _pushOpened.removeAt(0);
     }
     await _persistPushOpened();
-    final link = data['deep_link'];
-    final deepLink = link is String ? link.trim() : '';
+    final deepLink = open.deepLink;
     await _trackSdkEvent('push_opened', {
       'whisperr_message_id': id,
-      if (deepLink.isNotEmpty) 'deep_link': deepLink,
+      if (deepLink != null) 'deep_link': deepLink,
     });
     unawaited(flush());
     return true;
@@ -536,9 +740,13 @@ class WhisperrClient {
     _pendingPushToken = null;
     _lastPushToken = null;
     _lastPushUserId = null;
+    _lastPushMeta = null;
+    // The device permission stays; the next user gets it with their identify.
+    _permissionSentFor = null;
     _anonymousId = null;
     await _persistIdentity();
     await _persistPushState();
+    await _persistPermission();
     await _persistAnonymousId();
     if (!flushBeforeReset) unawaited(flush());
   }
@@ -756,8 +964,10 @@ class WhisperrClient {
     var changed = false;
     for (final c in channels) {
       if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) {
+        final meta = _pushMeta(c);
         _lastPushUserId = userId;
         _lastPushToken = c.address;
+        _lastPushMeta = meta.isEmpty ? null : meta;
         changed = true;
       }
     }
@@ -769,6 +979,21 @@ class WhisperrClient {
   /// delivered — otherwise a single rejection wedges that token opted-out of
   /// every future setPushToken. Clears the mark when a discarded op carried it.
   Future<void> _forgetPushMark(Iterable<WhisperrQueueOp> discarded) async {
+    // A permission report that never shipped must re-send on the next report.
+    final sentFor = _permissionSentFor;
+    final permission = _permission;
+    if (sentFor != null &&
+        permission != null &&
+        discarded.any((op) {
+          final traits = op.body['traits'];
+          return op.kind == WhisperrOpKind.identify &&
+              op.body['external_user_id'] == sentFor &&
+              traits is Map &&
+              traits[_permissionTrait] == permission.wireValue;
+        })) {
+      _permissionSentFor = null;
+      await _persistPermission();
+    }
     final token = _lastPushToken;
     final user = _lastPushUserId;
     if (token == null || user == null) return;
@@ -806,6 +1031,7 @@ class WhisperrClient {
       if (carried) {
         _lastPushUserId = null;
         _lastPushToken = null;
+        _lastPushMeta = null;
         await _persistPushState();
         return;
       }
@@ -973,10 +1199,27 @@ class WhisperrClient {
             decoded['token'] is String) {
           _lastPushUserId = decoded['user_id'] as String;
           _lastPushToken = decoded['token'] as String;
+          final meta = decoded['meta'];
+          _lastPushMeta = meta is String && meta.isNotEmpty ? meta : null;
         }
       }
     } catch (e) {
       _log('failed to restore persisted push state ($e)');
+    }
+    try {
+      final raw =
+          await _persistence.load(WhisperrPersistence.pushPermissionSlot);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          _permission = WhisperrPushPermission.fromWire(decoded['status']);
+          final sentFor = decoded['sent_for'];
+          _permissionSentFor =
+              _permission != null && sentFor is String ? sentFor : null;
+        }
+      }
+    } catch (e) {
+      _log('failed to restore push permission ($e)');
     }
     try {
       final raw = await _persistence.load(WhisperrPersistence.anonymousSlot);
@@ -1048,11 +1291,34 @@ class WhisperrClient {
       if (uid == null || token == null) {
         await _persistence.clear(WhisperrPersistence.pushSlot);
       } else {
-        await _persistence.save(WhisperrPersistence.pushSlot,
-            jsonEncode({'user_id': uid, 'token': token}));
+        await _persistence.save(
+            WhisperrPersistence.pushSlot,
+            jsonEncode({
+              'user_id': uid,
+              'token': token,
+              if (_lastPushMeta != null) 'meta': _lastPushMeta,
+            }));
       }
     } catch (e) {
       _log('failed to persist push state ($e)');
+    }
+  }
+
+  Future<void> _persistPermission() async {
+    try {
+      final status = _permission;
+      if (status == null) {
+        await _persistence.clear(WhisperrPersistence.pushPermissionSlot);
+      } else {
+        await _persistence.save(
+            WhisperrPersistence.pushPermissionSlot,
+            jsonEncode({
+              'status': status.wireValue,
+              if (_permissionSentFor != null) 'sent_for': _permissionSentFor,
+            }));
+      }
+    } catch (e) {
+      _log('failed to persist push permission ($e)');
     }
   }
 

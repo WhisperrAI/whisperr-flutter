@@ -1,0 +1,41 @@
+name: Publish whisperr_firebase_messaging
+
+# Publishes packages/whisperr_firebase_messaging to pub.dev when its tag is
+# pushed:
+#   git tag whisperr_firebase_messaging-v0.1.0 && git push origin whisperr_firebase_messaging-v0.1.0
+#
+# pub.dev automated publishing (OIDC), like publish.yml. Before the first
+# release: publish the package once by hand (pub.dev needs it to exist), then
+# on its admin page enable GitHub Actions publishing for this repo with the
+# tag pattern `whisperr_firebase_messaging-v{{version}}`. Publish the whisperr
+# version it depends on first.
+
+on:
+  push:
+    tags:
+      - "whisperr_firebase_messaging-v*"
+
+permissions:
+  id-token: write # required for pub.dev OIDC authentication
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/whisperr_firebase_messaging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      # Resolve and test against the published whisperr, as users will.
+      - run: rm pubspec_overrides.yaml
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+      - run: dart pub publish --force

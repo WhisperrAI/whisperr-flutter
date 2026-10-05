@@ -1,0 +1,4 @@
+# Develop and test against the whisperr package in this repo. Not published.
+dependency_overrides:
+  whisperr:
+    path: ../..

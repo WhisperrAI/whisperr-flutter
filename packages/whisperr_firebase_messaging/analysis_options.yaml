@@ -1,10 +1,6 @@
 include: package:flutter_lints/flutter.yaml
 
 analyzer:
-  exclude:
-    - example/**
-    # Its own package: analyzed in its own CI step.
-    - packages/**
   language:
     strict-casts: true
     strict-raw-types: true

@@ -4,7 +4,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// testable without Flutter platform plugins.
 ///
 /// State lives in named slots ([queueSlot], [identitySlot], [pushSlot],
-/// [anonymousSlot], [appSlot], [optOutSlot], [pushOpenedSlot]), each
+/// [anonymousSlot], [appSlot], [optOutSlot], [pushOpenedSlot],
+/// [pushPermissionSlot]), each
 /// holding a single string blob. Implementations decide how slots map to
 /// underlying storage keys.
 abstract class WhisperrPersistence {
@@ -33,6 +34,10 @@ abstract class WhisperrPersistence {
 
   /// Recent `whisperr_message_id`s already reported as `push_opened`.
   static const String pushOpenedSlot = 'push_opened';
+
+  /// The last notification permission reported through `setPushPermission`,
+  /// and the user it was sent for.
+  static const String pushPermissionSlot = 'push_permission';
 
   Future<String?> load(String slot);
   Future<void> save(String slot, String data);

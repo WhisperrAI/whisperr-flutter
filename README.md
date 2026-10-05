@@ -6,7 +6,7 @@ Identify your users and track product events so Whisperr can decide and deliver 
 
 ```yaml
 dependencies:
-  whisperr: ^0.4.0
+  whisperr: ^0.5.0
 ```
 
 ## Initialize
@@ -51,22 +51,63 @@ await Whisperr.instance.identify(
 
 ## Push notifications
 
-The SDK never bundles a push library — hand it the token your own messaging
-setup produces (e.g. `firebase_messaging`) and Whisperr keeps the `push`
-channel current:
+**Using `firebase_messaging`?** Add
+[`whisperr_firebase_messaging`](packages/whisperr_firebase_messaging/README.md).
+It asks for permission, registers the token with its kind, keeps both current,
+and tracks notification taps with deep links:
 
 ```dart
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:whisperr_firebase_messaging/whisperr_firebase_messaging.dart';
 
+final messaging = FirebaseMessaging.instance;
+await Whisperr.instance.registerFirebaseMessaging(messaging);
+await Whisperr.instance.handleNotificationOpens(
+  messaging,
+  onOpen: (open, message) {
+    if (open.deepLink != null) router.go(open.deepLink!);
+  },
+);
+```
+
+The rest of this section is for apps that wire push by hand. The core SDK
+never bundles a push library: hand it the token your messaging setup produces,
+and Whisperr keeps the `push` channel current.
+
+### Token and kind
+
+```dart
 final messaging = FirebaseMessaging.instance;
 
 // Current token (safe on every launch — repeats are a no-op):
 final token = await messaging.getToken();
-if (token != null) await Whisperr.instance.setPushToken(token);
+if (token != null) {
+  await Whisperr.instance.setPushToken(token, kind: WhisperrPushTokenKind.fcm);
+}
 
 // Rotations, forwarded automatically:
-final sub = Whisperr.instance.attachPushTokenStream(messaging.onTokenRefresh);
+final sub = Whisperr.instance.attachPushTokenStream(
+  messaging.onTokenRefresh,
+  kind: WhisperrPushTokenKind.fcm,
+);
 ```
+
+The kind tells Whisperr which provider can send to the token. Send what you
+know:
+
+| Token | Call |
+|---|---|
+| `firebase_messaging` token (Android and iOS) | `setPushToken(token, kind: WhisperrPushTokenKind.fcm)` |
+| Raw APNs token (iOS, sending through APNs directly) | `setPushToken(token, kind: WhisperrPushTokenKind.apns, pushEnv: WhisperrPushEnvironment.production)` |
+| OneSignal subscription id | `setPushToken(id, kind: WhisperrPushTokenKind.oneSignalSubscription)` |
+
+- With any metadata, `platform` defaults to the OS the app runs on.
+- `pushEnv` is the APNs environment: `sandbox` for development-signed builds,
+  `production` for TestFlight and the App Store. The SDK never guesses it.
+- `setPushToken(token)` without metadata sends the token only. The server then
+  infers the kind from its format.
+
+### Token lifecycle
 
 - Called **after login**, `setPushToken` re-identifies the push channel
   immediately.
@@ -80,21 +121,53 @@ final sub = Whisperr.instance.attachPushTokenStream(messaging.onTokenRefresh);
   user's other devices are never touched.
 - After `reset()` (logout), call `setPushToken` again once the next user logs
   in.
-- Call `setPushToken` only while the OS reports notification permission. The
-  token is sent opted in.
+
+### Permission
+
+Report the OS notification permission on every launch and every resume. A
+repeated status is a no-op.
+
+```dart
+WhisperrPushPermission toWhisperr(AuthorizationStatus status) =>
+    switch (status) {
+      AuthorizationStatus.authorized => WhisperrPushPermission.granted,
+      AuthorizationStatus.provisional => WhisperrPushPermission.provisional,
+      AuthorizationStatus.notDetermined => WhisperrPushPermission.undetermined,
+      _ => WhisperrPushPermission.denied,
+    };
+
+final settings = await messaging.getNotificationSettings();
+await Whisperr.instance
+    .setPushPermission(toWhisperr(settings.authorizationStatus));
+```
+
+- The user gets the trait `push_permission`.
+- `denied` opts this device's token out, so the engine does not choose push
+  for it. While the status is `denied`, `setPushToken` holds the token back.
+  When you report `granted` or `provisional` again, the SDK registers it again.
+- Before login, the status goes with the next `identify()`.
+
+### Push opens
 
 Report push taps, so Whisperr learns which messages work:
 
 ```dart
-FirebaseMessaging.onMessageOpenedApp
-    .listen((m) => Whisperr.instance.trackPushOpened(m.data));
+Future<void> onTap(RemoteMessage m) async {
+  await Whisperr.instance.trackPushOpened(m.data);
+  final link = WhisperrPushOpen.fromData(m.data)?.deepLink;
+  if (link != null) router.go(link);
+}
+
+FirebaseMessaging.onMessageOpenedApp.listen(onTap);
 final initial = await FirebaseMessaging.instance.getInitialMessage();
-if (initial != null) await Whisperr.instance.trackPushOpened(initial.data);
+if (initial != null) await onTap(initial);
 ```
 
 `trackPushOpened` sends `push_opened` only for Whisperr pushes (the data has
 `whisperr_message_id`). It ignores a message id it already reported, so calling
-it from both hooks is safe.
+it from both hooks is safe. `WhisperrPushOpen.fromData` reads the message id
+and the deep link (`whisperr_deep_link`, else `deep_link`) without sending
+anything.
 
 ## Track
 
