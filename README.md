@@ -122,8 +122,11 @@ The SDK sends these events for you. You write no code.
 | `app_backgrounded` | the app leaves the screen | `foreground_ms` |
 
 Every SDK-generated event (also `screen_viewed` and `push_opened`) carries
-`app_version`, `app_build`, `os_name`, `os_version`, `platform` (`flutter`),
-`locale` and `timezone_offset_minutes`. A key the platform cannot provide is
+`sdk_name` (`whisperr-flutter`), `sdk_version`, `app_version`, `app_build`,
+`platform` and `os_name` (the OS family: `ios`, `android`, `web`), `os_version`,
+`locale` and `timezone_offset_minutes`. `timezone` is sent only when it is a
+real IANA name. Flutter cannot read the IANA zone without a plugin, so most
+apps get the offset only. A key the platform cannot provide is
 left out (for example `os_version` on Android). Turn the automatic events off
 with `WhisperrOptions(trackAutomaticEvents: false)`.
 

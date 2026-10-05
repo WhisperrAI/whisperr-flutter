@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:whisperr/src/api_client.dart' show parseRetryAfter;
+import 'package:whisperr/src/app_context.dart' show isIanaTimezone;
 import 'package:whisperr/src/os_version_io.dart' show parseOsVersion;
 import 'package:whisperr/whisperr.dart';
 
@@ -14,7 +15,7 @@ const _appContext = <String, Object?>{
   'app_build': '42',
   'os_name': 'ios',
   'os_version': '17.4',
-  'platform': 'flutter',
+  'platform': 'ios',
 };
 
 const _deviceTraits = <String, Object?>{
@@ -23,7 +24,12 @@ const _deviceTraits = <String, Object?>{
 };
 
 /// The flat context every SDK-generated event carries (with the pins above).
-const _context = <String, Object?>{..._appContext, ..._deviceTraits};
+const _context = <String, Object?>{
+  'sdk_name': 'whisperr-flutter',
+  'sdk_version': kWhisperrSdkVersion,
+  ..._appContext,
+  ..._deviceTraits,
+};
 
 class _Harness {
   _Harness({WhisperrPersistence? persistence})
@@ -448,6 +454,48 @@ void main() {
       final channels = h.identifies.single['channels'] as List;
       expect(channels.single,
           {'channel': 'email', 'address': 'ada@example.com', 'opted_in': true});
+    });
+  });
+
+  group('timezone', () {
+    test('only real IANA names count as timezone', () {
+      expect(isIanaTimezone('Europe/Berlin'), isTrue);
+      expect(isIanaTimezone('America/Argentina/Buenos_Aires'), isTrue);
+      expect(isIanaTimezone('Etc/GMT+4'), isTrue);
+      expect(isIanaTimezone('UTC'), isTrue);
+      expect(isIanaTimezone('CET'), isFalse);
+      expect(isIanaTimezone('+04'), isFalse);
+      expect(isIanaTimezone('GMT+04:00'), isFalse);
+      expect(isIanaTimezone(120), isFalse);
+    });
+
+    test('events keep the offset and drop a non-IANA timezone', () async {
+      final h = _Harness();
+      final client = WhisperrClient(
+        apiClient: WhisperrApiClient(
+          httpClient: h.mock,
+          baseUrl: 'https://api.test',
+          apiKey: 'wrk_test',
+          sdkVersion: 'test',
+        ),
+        persistence: h.persistence,
+        options: const WhisperrOptions(
+          flushOnLifecyclePause: false,
+          trackAutomaticEvents: false,
+        ),
+        clock: () => h.now,
+        random: h.random,
+        deviceTraits: () => {'timezone': 'CET', 'timezone_offset_minutes': 60},
+        appContext: () async => _appContext,
+      );
+      await client.start();
+      await client.screen('Home');
+      await client.flush();
+      await client.close();
+
+      final props = _props(h.events.single);
+      expect(props.containsKey('timezone'), isFalse);
+      expect(props['timezone_offset_minutes'], 60);
     });
   });
 

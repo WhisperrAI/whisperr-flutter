@@ -5,9 +5,10 @@
 - **Automatic app events, on by default.** `app_installed`, `app_updated`
   (with `previous_version` / `previous_build`), `app_opened` (`cold_start`) and
   `app_backgrounded` (`foreground_ms`). Every SDK-generated event carries
-  `app_version`, `app_build`, `os_name`, `os_version` (iOS, macOS, Windows),
-  `platform` (`flutter`), `locale` and `timezone_offset_minutes` (or your
-  `timezone`). Turn them off with `WhisperrOptions(trackAutomaticEvents: false)`.
+  `sdk_name` (`whisperr-flutter`), `sdk_version`, `app_version`, `app_build`,
+  `platform` and `os_name` (the OS family: `ios`, `android`, `web`),
+  `os_version` (iOS, macOS, Windows), `locale` and `timezone_offset_minutes`
+  (plus `timezone` only when it is a real IANA name). Turn them off with `WhisperrOptions(trackAutomaticEvents: false)`.
   Install and update come from a persisted "last seen version"; an app that
   already has SDK state from an older version records its version silently
   instead of sending `app_installed`.

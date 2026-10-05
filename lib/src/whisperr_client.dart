@@ -651,16 +651,24 @@ class WhisperrClient {
     return track(type, properties: {..._automaticProperties(), ...properties});
   }
 
-  /// `app_version`, `app_build`, `os_name`, `os_version`, `platform` (resolved
-  /// once per launch) plus the current `locale` and timezone.
+  /// `sdk_name`, `sdk_version`, `app_version`, `app_build`, `os_name`,
+  /// `os_version`, `platform` (resolved once per launch) plus the current
+  /// `locale` and `timezone_offset_minutes` / IANA `timezone`.
   Map<String, dynamic> _automaticProperties() {
-    final out = <String, dynamic>{};
+    final out = <String, dynamic>{
+      'sdk_name': kWhisperrSdkName,
+      'sdk_version': kWhisperrSdkVersion,
+    };
     _appContext.forEach((k, v) {
       if (v != null) out[k] = v;
     });
     _resolveDeviceTraits().forEach((k, v) {
       if (v != null) out[k] = v;
     });
+    // `timezone` only as a real IANA name; otherwise the offset stands in.
+    if (out.containsKey('timezone') && !isIanaTimezone(out['timezone'])) {
+      out.remove('timezone');
+    }
     return out;
   }
 
