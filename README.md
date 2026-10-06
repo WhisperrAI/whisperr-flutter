@@ -16,7 +16,7 @@ Call once at startup (e.g. in `main`). Get an **app ingestion key** from the Whi
 ```dart
 import 'package:whisperr/whisperr.dart';
 
-await Whisperr.initialize(apiKey: 'wrk_xxx');
+await Whisperr.initialize(apiKey: 'wpk_xxx');
 ```
 
 `baseUrl` defaults to `https://api.whisperr.net`; pass it only to target a self-hosted or local backend.
@@ -235,7 +235,7 @@ The choice is persisted across restarts.
 
 ```dart
 await Whisperr.initialize(
-  apiKey: 'wrk_xxx',
+  apiKey: 'wpk_xxx',
   options: const WhisperrOptions(
     flushInterval: Duration(seconds: 15),
     flushAt: 20,
