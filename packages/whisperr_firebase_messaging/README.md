@@ -33,7 +33,7 @@ import 'package:whisperr/whisperr.dart';
 import 'package:whisperr_firebase_messaging/whisperr_firebase_messaging.dart';
 
 await Firebase.initializeApp();
-await Whisperr.initialize(apiKey: 'wrk_...');
+await Whisperr.initialize(apiKey: 'wpk_...');
 
 // After login, at the moment you want the OS prompt:
 await Whisperr.instance.identify(user.id, traits: {'first_name': user.firstName});

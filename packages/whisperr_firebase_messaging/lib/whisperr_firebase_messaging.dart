@@ -1,7 +1,7 @@
 /// Firebase Cloud Messaging for the Whisperr Flutter SDK.
 ///
 /// ```dart
-/// await Whisperr.initialize(apiKey: 'wrk_...');
+/// await Whisperr.initialize(apiKey: 'wpk_...');
 /// await Whisperr.instance.identify(user.id);
 /// await Whisperr.instance.registerFirebaseMessaging(FirebaseMessaging.instance);
 /// await Whisperr.instance.handleNotificationOpens(

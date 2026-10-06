@@ -6,7 +6,7 @@ Future<void> main() async {
 
   await Whisperr.initialize(
     // baseUrl defaults to https://api.whisperr.net — no need to set it.
-    apiKey: const String.fromEnvironment('WHISPERR_API_KEY', defaultValue: 'wrk_replace_me'),
+    apiKey: const String.fromEnvironment('WHISPERR_API_KEY', defaultValue: 'wpk_replace_me'),
     options: const WhisperrOptions(debug: true),
   );
 

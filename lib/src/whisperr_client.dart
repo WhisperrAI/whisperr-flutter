@@ -1380,7 +1380,7 @@ class WhisperrClient {
 /// Static entrypoint for the Whisperr SDK.
 ///
 /// ```dart
-/// await Whisperr.initialize(apiKey: 'wrk_...', baseUrl: 'https://api.yourhost.com');
+/// await Whisperr.initialize(apiKey: 'wpk_...', baseUrl: 'https://api.yourhost.com');
 /// await Whisperr.instance.identify('user_123', traits: {'plan': 'pro'});
 /// Whisperr.instance.track('checkout_completed', properties: {'amount': 42});
 /// ```
