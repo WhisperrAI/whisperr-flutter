@@ -27,9 +27,6 @@ final _expoPushToken = RegExp(r'^(?:Exponent|Expo)PushToken\[[^\]]+\]$');
 /// The `platform` values the spec allows on a push entry.
 const _pushPlatforms = {'ios', 'android', 'web', 'macos', 'windows', 'linux'};
 
-/// The trait that carries the notification permission.
-const _permissionTrait = 'push_permission';
-
 /// How many reported `whisperr_message_id`s [WhisperrClient.trackPushOpened]
 /// remembers for dedupe.
 const int _maxRememberedPushOpens = 50;
@@ -93,10 +90,10 @@ class WhisperrClient {
   /// The token metadata last delivered with [_lastPushToken] (see
   /// [_pushMeta]), so a token re-sent with new metadata is not deduped away.
   String? _lastPushMeta;
-  /// The notification permission last reported through [setPushPermission],
-  /// and the user it was sent for. Persisted.
-  WhisperrPushPermission? _permission;
-  String? _permissionSentFor;
+  /// The device's notification permission: the status last reported through
+  /// [setPushPermission] and the one last sent as `push_permission_changed`.
+  /// Persisted.
+  WhisperrPermissionRecord _permission = const WhisperrPermissionRecord();
   Timer? _timer;
   Future<void>? _flushing;
   AppLifecycleListener? _lifecycle;
@@ -115,6 +112,8 @@ class WhisperrClient {
   bool _coldOpenPending = false;
   DateTime? _foregroundSince;
   bool _started = false;
+  /// Set by [start]; [optOut] waits for it so it sees the restored pair.
+  Future<bool>? _restoring;
   bool _closed = false;
   int _seq = 0;
 
@@ -126,7 +125,7 @@ class WhisperrClient {
   /// before [identify], or null if none was needed yet. Rotated by [reset].
   String? get anonymousId => _anonymousId;
 
-  /// Whether [setOptOut] stopped all sending. Persisted across restarts.
+  /// Whether [optOut] stopped all sending. Persisted across restarts.
   bool get isOptedOut => _optedOut;
 
   /// Number of operations currently buffered (visible for tests/diagnostics).
@@ -141,7 +140,8 @@ class WhisperrClient {
     if (_started) return;
     _started = true;
 
-    final hadPriorState = await _restore();
+    final restoring = _restoring = _restore();
+    final hadPriorState = await restoring;
 
     _timer = Timer.periodic(_options.flushInterval, (_) => unawaited(flush()));
 
@@ -269,7 +269,7 @@ class WhisperrClient {
     // supplied its own push channel — or the pair was already delivered
     // (e.g. restored after a restart), in which case re-sending is redundant.
     // A token held back while notifications are denied stays held back.
-    final denied = _permission == WhisperrPushPermission.denied;
+    final denied = _permission.current == WhisperrPushPermission.denied;
     final pending = denied ? null : _pendingPushToken;
     if (pending != null &&
         !resolved.any((c) => c.type == WhisperrChannelType.push) &&
@@ -301,13 +301,6 @@ class WhisperrClient {
     final anonymousId = _anonymousId;
     if (anonymousId != null) body['anonymous_id'] = anonymousId;
     final mergedTraits = _withDeviceTraits(traits);
-    // The device's notification permission, once per user (the caller's
-    // value wins).
-    final permission = _permission;
-    final sendPermission = permission != null &&
-        _permissionSentFor != id &&
-        !mergedTraits.containsKey(_permissionTrait);
-    if (sendPermission) mergedTraits[_permissionTrait] = permission.wireValue;
     if (mergedTraits.isNotEmpty) body['traits'] = mergedTraits;
     if (preferredChannel != null && preferredChannel.trim().isNotEmpty) {
       body['preferred_channel'] = preferredChannel.trim();
@@ -322,10 +315,6 @@ class WhisperrClient {
       afterAccepted: () async {
         await _rememberPushChannel(id, resolved);
         if (!denied) _pendingPushToken = null;
-        if (sendPermission) {
-          _permissionSentFor = id;
-          await _persistPermission();
-        }
       },
     );
     unawaited(flush());
@@ -381,7 +370,7 @@ class WhisperrClient {
     final channel = _pushRegistration(t,
         kind: kind, platform: platform, pushEnv: pushEnv);
     final uid = _currentUserId;
-    if (uid == null || _permission == WhisperrPushPermission.denied) {
+    if (uid == null || _permission.current == WhisperrPushPermission.denied) {
       _pendingPushToken = channel; // the next identify() / allowed report
       return;
     }
@@ -416,84 +405,84 @@ class WhisperrClient {
   }
 
   /// Reports the OS notification permission. Safe to call on every launch and
-  /// every return to the foreground: a repeated status is a no-op, also across
-  /// restarts.
+  /// every return to the foreground.
   ///
-  /// The status goes to the user as the trait `push_permission`. `denied`
-  /// also opts out the push token this client registered, so the engine stops
-  /// choosing push for this device; `granted` / `provisional` registers it
-  /// again. Before [identify], the status goes with the next identify.
+  /// It sends the event `push_permission_changed` with `status` (and
+  /// `previous_status`, the status sent before) when the status differs from
+  /// the last one sent from this device, also across restarts. It sends
+  /// always, also when automatic events are off. Before [identify] the event
+  /// goes out under this device's [anonymousId]. [reset] forgets the sent
+  /// status, so the next user gets a fresh report. While opted out it sends
+  /// nothing.
+  ///
+  /// `denied` also opts out the push token this client registered and holds
+  /// it, so the engine stops choosing push for this device; `granted` /
+  /// `provisional` registers it again.
   Future<void> setPushPermission(WhisperrPushPermission status) =>
       _mutateIdentity(() => _setPushPermission(status));
 
   Future<void> _setPushPermission(WhisperrPushPermission status) async {
     _ensureUsable();
-    if (_optedOut) return;
-    final changed = _permission != status;
-    final uid = _currentUserId;
-    if (uid == null) {
-      if (changed) {
-        _permission = status;
-        _permissionSentFor = null;
-        await _persistPermission();
-      }
-      return;
+    final sent = _permission.sent;
+    final report = !_optedOut && sent != status;
+    if (report) {
+      await _trackSdkEvent('push_permission_changed', {
+        'status': status.wireValue,
+        if (sent != null) 'previous_status': sent.wireValue,
+      });
     }
-    if (!changed && _permissionSentFor == uid) return;
+    _permission =
+        WhisperrPermissionRecord(current: status, sent: report ? status : sent);
+    await _persistPermission();
+    if (report) unawaited(flush());
 
-    final channels = <WhisperrChannel>[];
-    var optOut = false;
-    WhisperrChannel? register;
+    final uid = _currentUserId;
+    if (_optedOut || uid == null) return;
     final last = _lastPushUserId == uid ? _lastPushToken : null;
     if (status == WhisperrPushPermission.denied) {
-      if (last != null) {
-        // Stop push to this device; hold the token so it registers again as
-        // soon as the permission comes back.
-        channels.add(WhisperrChannel.push(last, optedIn: false));
-        _pendingPushToken ??= _registrationFromMeta(last, _lastPushMeta);
-        optOut = true;
-      }
-    } else if (status.allowsPush && _pendingPushToken != null) {
-      final reg = _pendingPushToken!;
-      if (last != null && last != reg.address) {
-        channels.add(WhisperrChannel.push(last, optedIn: false));
-      }
-      if (last != reg.address) {
-        channels.add(reg);
-        register = reg;
-      }
-    }
-    final body = <String, dynamic>{
-      'external_user_id': uid,
-      'traits': {_permissionTrait: status.wireValue},
-      if (channels.isNotEmpty)
-        'channels': channels.map((c) => c.toJson()).toList(),
-    };
-    await _enqueue(
-      WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: body),
-      afterAccepted: () async {
-        _permission = status;
-        _permissionSentFor = uid;
-        await _persistPermission();
-        if (optOut) {
+      if (last == null) return;
+      // Stop push to this device; hold the token so it registers again as
+      // soon as the permission comes back.
+      await _enqueue(
+        WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: {
+          'external_user_id': uid,
+          'channels': [WhisperrChannel.push(last, optedIn: false).toJson()],
+        }),
+        afterAccepted: () async {
+          _pendingPushToken ??= _registrationFromMeta(last, _lastPushMeta);
           _lastPushUserId = null;
           _lastPushToken = null;
           _lastPushMeta = null;
           await _persistPushState();
-        }
-        final registered = register;
-        if (registered != null) {
-          final meta = _pushMeta(registered);
+        },
+      );
+    } else if (status.allowsPush) {
+      final reg = _pendingPushToken;
+      if (reg == null) return;
+      if (last == reg.address) {
+        _pendingPushToken = null; // already registered
+        return;
+      }
+      await _enqueue(
+        WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: {
+          'external_user_id': uid,
+          'channels': [
+            if (last != null) WhisperrChannel.push(last, optedIn: false).toJson(),
+            reg.toJson(),
+          ],
+        }),
+        afterAccepted: () async {
+          final meta = _pushMeta(reg);
           _lastPushUserId = uid;
-          _lastPushToken = registered.address;
+          _lastPushToken = reg.address;
           _lastPushMeta = meta.isEmpty ? null : meta;
           _pendingPushToken = null;
           await _persistPushState();
-        } else if (status.allowsPush && last == _pendingPushToken?.address) {
-          _pendingPushToken = null; // already registered
-        }
-      },
-    );
+        },
+      );
+    } else {
+      return;
+    }
     unawaited(flush());
   }
 
@@ -688,19 +677,89 @@ class WhisperrClient {
     return true;
   }
 
-  /// Opts this device out of (or back into) Whisperr. Opting out stops all
-  /// sending at once: queued events and identifies are deleted, and later
-  /// [track], [identify], [setPushToken], [screen], [trackPushOpened] and
-  /// automatic events send nothing. [identify] still records the user id
-  /// locally, so opting back in attributes new events correctly. The choice
-  /// is persisted across restarts. Nothing is sent to the server about the
-  /// choice itself.
-  Future<void> setOptOut(bool optOut) async {
+  /// Opts this device out of Whisperr: nothing is queued or sent until
+  /// [optIn]. Queued events and identifies are deleted, and a buffered push
+  /// token is dropped. [identify] still records the user id locally, so
+  /// opting back in attributes new events correctly. The choice is persisted
+  /// and kept across [reset].
+  ///
+  /// When this client registered a push token, one identify opts that token
+  /// out (`opted_in: false`) under the user it was registered for, so the
+  /// server stops push to this device. Push opt-outs already queued (a
+  /// rotation, a denied permission) are kept ahead of it. They are delivered
+  /// and retried like any queued call, also across restarts. Email, SMS and
+  /// the user's other devices keep their state, and data already sent is not
+  /// deleted.
+  Future<void> optOut() => _mutateIdentity(_optOut);
+
+  Future<void> _optOut() async {
     _ensureUsable();
-    if (_optedOut == optOut) return;
-    _optedOut = optOut;
+    await _restoring;
+    if (_optedOut) return;
+    _optedOut = true;
+    _pendingPushToken = null;
+    await _persistOptOut();
+    await _mutateQueue(() async {
+      final next = _optOutQueue();
+      await _persistQueue(next);
+      _queue
+        ..clear()
+        ..addAll(next);
+    });
+    await _persistPushState();
+    unawaited(flush());
+  }
+
+  /// The queue that stays while opted out: the push opt-outs already queued,
+  /// then the opt-out of the last-sent pair (see [_takePushOptOut]).
+  List<WhisperrQueueOp> _optOutQueue() {
+    final optOut = _takePushOptOut();
+    return [
+      ..._queue.map(_pushRetirements).nonNulls,
+      if (optOut != null) optOut,
+    ];
+  }
+
+  /// The identify that opts this device's last-sent push token out, under
+  /// the user it was sent for. Forgets the pair, so the token registers
+  /// again after [optIn].
+  WhisperrQueueOp? _takePushOptOut() {
+    final uid = _lastPushUserId;
+    final token = _lastPushToken;
+    _lastPushUserId = null;
+    _lastPushToken = null;
+    _lastPushMeta = null;
+    if (uid == null || token == null) return null;
+    return WhisperrQueueOp(
+      id: _nextId(),
+      kind: WhisperrOpKind.identify,
+      optOut: true,
+      body: {
+        'external_user_id': uid,
+        'channels': [WhisperrChannel.push(token, optedIn: false).toJson()],
+      },
+    );
+  }
+
+  /// Resumes sending after [optOut]. The next [setPushToken] registers the
+  /// push token again.
+  Future<void> optIn() => _mutateIdentity(_optIn);
+
+  Future<void> _optIn() async {
+    _ensureUsable();
+    if (!_optedOut) return;
+    _optedOut = false;
+    await _persistOptOut();
+    unawaited(flush());
+  }
+
+  /// Calls [WhisperrClient.optOut] for `true` and [optIn] for `false`.
+  @Deprecated('Use optOut() or optIn().')
+  Future<void> setOptOut(bool optOut) => optOut ? this.optOut() : optIn();
+
+  Future<void> _persistOptOut() async {
     try {
-      if (optOut) {
+      if (_optedOut) {
         await _persistence.save(WhisperrPersistence.optOutSlot, '1');
       } else {
         await _persistence.clear(WhisperrPersistence.optOutSlot);
@@ -709,18 +768,12 @@ class WhisperrClient {
       _emit('persistence', 'failed to persist opt-out');
       _log('failed to persist opt-out ($e)');
     }
-    if (!optOut) return;
-    _pendingPushToken = null;
-    await _mutateQueue(() async {
-      await _persistQueue(const []);
-      _queue.clear();
-    });
   }
 
   /// Forces a flush and completes when the drain pass finishes (whether it
   /// emptied the queue or stopped on a transient/auth error).
   Future<void> flush() {
-    if (_closed || _optedOut || _queue.isEmpty) return Future.value();
+    if (_closed || !_headDeliverable) return Future.value();
     return _flushing ??= _drain().whenComplete(() => _flushing = null);
   }
 
@@ -741,8 +794,8 @@ class WhisperrClient {
     _lastPushToken = null;
     _lastPushUserId = null;
     _lastPushMeta = null;
-    // The device permission stays; the next user gets it with their identify.
-    _permissionSentFor = null;
+    // The device permission stays; the next report sends it again.
+    _permission = WhisperrPermissionRecord(current: _permission.current);
     _anonymousId = null;
     await _persistIdentity();
     await _persistPushState();
@@ -979,21 +1032,6 @@ class WhisperrClient {
   /// delivered — otherwise a single rejection wedges that token opted-out of
   /// every future setPushToken. Clears the mark when a discarded op carried it.
   Future<void> _forgetPushMark(Iterable<WhisperrQueueOp> discarded) async {
-    // A permission report that never shipped must re-send on the next report.
-    final sentFor = _permissionSentFor;
-    final permission = _permission;
-    if (sentFor != null &&
-        permission != null &&
-        discarded.any((op) {
-          final traits = op.body['traits'];
-          return op.kind == WhisperrOpKind.identify &&
-              op.body['external_user_id'] == sentFor &&
-              traits is Map &&
-              traits[_permissionTrait] == permission.wireValue;
-        })) {
-      _permissionSentFor = null;
-      await _persistPermission();
-    }
     final token = _lastPushToken;
     final user = _lastPushUserId;
     if (token == null || user == null) return;
@@ -1038,9 +1076,14 @@ class WhisperrClient {
     }
   }
 
+  /// Whether the queue head may go out: anything while opted in, only push
+  /// opt-outs while opted out.
+  bool get _headDeliverable =>
+      _queue.isNotEmpty && (!_optedOut || _queue.first.optOut);
+
   Future<void> _drain() async {
     var attempt = 0;
-    while (_queue.isNotEmpty && !_closed && !_optedOut) {
+    while (!_closed && _headDeliverable) {
       final head = _queue.first;
       try {
         if (head.kind == WhisperrOpKind.identify) {
@@ -1071,7 +1114,11 @@ class WhisperrClient {
           _log('dropping op after permanent client error ($e)');
           // Overflow may already have evicted this request and cleared its
           // push mark. Do not clear a newer registration's mark a second time.
-          final discarded = _queue.where((op) => op.id == head.id).toList();
+          // The push opt-outs that optOut() cut from this request share its
+          // id but were not sent; they stay.
+          final discarded = _queue
+              .where((op) => op.id == head.id && op.optOut == head.optOut)
+              .toList();
           await _forgetPushMark(discarded);
           await _removeQueuedOps(discarded);
           continue;
@@ -1131,7 +1178,7 @@ class WhisperrClient {
     bool requirePersistence = false,
     Future<void> Function()? afterAccepted,
   }) => _mutateQueue(() async {
-    // An op that raced setOptOut(true) past its entry check is discarded.
+    // An op that raced optOut() past its entry check is discarded.
     if (_optedOut) return;
     final next = [..._queue, op];
     var dropped = 0;
@@ -1212,10 +1259,7 @@ class WhisperrClient {
       if (raw != null && raw.isNotEmpty) {
         final decoded = jsonDecode(raw);
         if (decoded is Map) {
-          _permission = WhisperrPushPermission.fromWire(decoded['status']);
-          final sentFor = decoded['sent_for'];
-          _permissionSentFor =
-              _permission != null && sentFor is String ? sentFor : null;
+          _permission = WhisperrPermissionRecord.fromJson(decoded);
         }
       }
     } catch (e) {
@@ -1242,10 +1286,15 @@ class WhisperrClient {
     } catch (e) {
       _log('failed to restore push-opened ids ($e)');
     }
-    if (_optedOut && _queue.isNotEmpty) {
-      // Opted out while a queue write was racing: never send it.
-      _queue.clear();
-      await _persistQueue(const []);
+    if (_optedOut) {
+      // Keep only push opt-outs: a queue write may have raced optOut(), and
+      // an older SDK (or a crash inside optOut()) may have left the pair.
+      final kept = _optOutQueue();
+      _queue
+        ..clear()
+        ..addAll(kept);
+      await _persistQueue(kept);
+      await _persistPushState();
     }
     return _queue.isNotEmpty ||
         _currentUserId != null ||
@@ -1306,16 +1355,12 @@ class WhisperrClient {
 
   Future<void> _persistPermission() async {
     try {
-      final status = _permission;
-      if (status == null) {
+      final record = _permission;
+      if (record.isEmpty) {
         await _persistence.clear(WhisperrPersistence.pushPermissionSlot);
       } else {
-        await _persistence.save(
-            WhisperrPersistence.pushPermissionSlot,
-            jsonEncode({
-              'status': status.wireValue,
-              if (_permissionSentFor != null) 'sent_for': _permissionSentFor,
-            }));
+        await _persistence.save(WhisperrPersistence.pushPermissionSlot,
+            jsonEncode(record.toJson()));
       }
     } catch (e) {
       _log('failed to persist push permission ($e)');
@@ -1438,4 +1483,23 @@ class Whisperr {
     await _instance?.close();
     _instance = null;
   }
+}
+
+/// [op] cut down to its push opt-outs (a rotation, a denied permission, an
+/// earlier opt-out), marked to go out while opted out; null when it retires
+/// no token.
+WhisperrQueueOp? _pushRetirements(WhisperrQueueOp op) {
+  final channels = op.body['channels'];
+  if (op.kind != WhisperrOpKind.identify || channels is! List) return null;
+  final retired = [
+    for (final c in channels)
+      if (c is Map && c['channel'] == 'push' && c['opted_in'] == false) c,
+  ];
+  if (retired.isEmpty) return null;
+  return WhisperrQueueOp(
+    id: op.id,
+    kind: WhisperrOpKind.identify,
+    optOut: true,
+    body: {'external_user_id': op.body['external_user_id'], 'channels': retired},
+  );
 }

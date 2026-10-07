@@ -46,8 +46,9 @@ What it does:
 
 1. It asks for permission (`requestPermission`), or only reads it with
    `requestPermission: false`.
-2. It reports the permission: `setPushPermission(...)`. The user gets the
-   trait `push_permission`. `denied` opts this device's token out.
+2. It reports the permission: `setPushPermission(...)`. The SDK sends the
+   event `push_permission_changed` when the status changed. `denied` opts
+   this device's token out.
 3. If notifications are allowed, it registers the FCM token with
    `kind: fcm` and the device platform. On iOS it waits briefly for the APNs
    token first, because Firebase needs it.

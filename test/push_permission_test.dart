@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -10,25 +11,92 @@ const _expo = 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]';
 const _apns =
     'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90';
 
+/// The common properties with this harness's pins.
+const _common = <String, Object?>{
+  'sdk_name': 'whisperr-flutter',
+  'sdk_version': kWhisperrSdkVersion,
+  'platform': 'ios',
+};
+
+/// Storage whose reads finish a timer tick later, like a first disk read.
+class _SlowLoads extends InMemoryPersistence {
+  @override
+  Future<String?> load(String slot) async {
+    await Future<void>.delayed(Duration.zero);
+    return super.load(slot);
+  }
+}
+
 class _Harness {
   _Harness() {
     mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      if (req.url.path == '/v1/identify') identifies.add(body);
-      if (req.url.path == '/v1/events/batch') {
+      attempts.add((path: req.url.path, body: body));
+      // A drain that resends forever never yields to a timer, so a test
+      // timeout cannot stop it.
+      if (attempts.length > 50) throw StateError('request loop');
+      var code = status;
+      final held = hold;
+      if (held != null) {
+        hold = null;
+        holding.complete();
+        code = await held.future;
+      }
+      if (code == 200 && req.url.path == '/v1/identify') {
+        identifies.add(body);
+      }
+      if (code == 200 && req.url.path == '/v1/events/batch') {
         events.addAll((body['events'] as List).cast<Map<String, dynamic>>());
       }
-      return http.Response('{}', status);
+      return http.Response('{}', code);
     });
   }
 
+  /// Every request sent, whatever the answer.
+  final attempts = <({String path, Map<String, dynamic> body})>[];
+
+  /// The identify bodies and events the server accepted.
   final identifies = <Map<String, dynamic>>[];
   final events = <Map<String, dynamic>>[];
-  final persistence = InMemoryPersistence();
+  WhisperrPersistence persistence = InMemoryPersistence();
   int status = 200;
   late final MockClient mock;
 
+  /// When set, the next request waits for it and answers with its status.
+  Completer<int>? hold;
+
+  /// Completes when the held request reaches the server.
+  final holding = Completer<void>();
+
+  /// Every attempt so far was an identify that only opts push tokens out.
+  void expectOnlyPushOptOuts() {
+    for (final a in attempts) {
+      expect(a.path, '/v1/identify');
+      expect(a.body.keys, unorderedEquals(['external_user_id', 'channels']));
+      for (final c in a.body['channels'] as List) {
+        expect(c,
+            {'channel': 'push', 'address': isA<String>(), 'opted_in': false});
+      }
+    }
+  }
+
+  List<Map<String, dynamic>> get permissionEvents => [
+        for (final e in events)
+          if (e['event_type'] == 'push_permission_changed')
+            {
+              if (e['external_user_id'] != null)
+                'external_user_id': e['external_user_id'],
+              'properties': e['properties'],
+            },
+      ];
+
   Future<WhisperrClient> start() async {
+    final client = build();
+    await client.start();
+    return client;
+  }
+
+  WhisperrClient build() {
     final client = WhisperrClient(
       apiClient: WhisperrApiClient(
         httpClient: mock,
@@ -50,7 +118,6 @@ class _Harness {
       appContext: () async => const <String, Object?>{'platform': 'ios'},
     );
     addTearDown(client.close);
-    await client.start();
     return client;
   }
 }
@@ -180,27 +247,55 @@ void main() {
   });
 
   group('setPushPermission', () {
-    test('sends the push_permission trait once, also across restarts',
+    test('sends push_permission_changed once per status, also across restarts',
         () async {
       final h = _Harness();
       final first = await h.start();
       await first.identify('user_1');
-      await first.setPushPermission(WhisperrPushPermission.granted);
+      await first.setPushPermission(WhisperrPushPermission.undetermined);
+      await first.setPushPermission(WhisperrPushPermission.undetermined);
       await first.setPushPermission(WhisperrPushPermission.granted);
       await first.close();
 
       final second = await h.start();
       await second.setPushPermission(WhisperrPushPermission.granted);
       await second.flush();
-      expect(h.identifies.skip(1).toList(), [
+      expect(h.permissionEvents, [
         {
           'external_user_id': 'user_1',
-          'traits': {'push_permission': 'granted'},
-        }
+          'properties': {..._common, 'status': 'not_determined'},
+        },
+        {
+          'external_user_id': 'user_1',
+          'properties': {
+            ..._common,
+            'status': 'authorized',
+            'previous_status': 'not_determined',
+          },
+        },
+      ]);
+      // The event is the only record: no trait, no extra identify.
+      expect(h.identifies, [
+        {'external_user_id': 'user_1', 'anonymous_id': first.anonymousId}
+          ..removeWhere((_, v) => v == null)
       ]);
     });
 
-    test('denied opts the token out and holds it; granted re-registers it',
+    test('before identify the event goes out on the anonymous lane', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.setPushPermission(WhisperrPushPermission.denied);
+      await c.identify('user_1');
+      await c.flush();
+      final event = h.events.single;
+      expect(event['event_type'], 'push_permission_changed');
+      expect(event['anonymous_id'], c.anonymousId);
+      expect(event.containsKey('external_user_id'), isFalse);
+      expect(event['properties'], {..._common, 'status': 'denied'});
+      expect(h.identifies.single.containsKey('traits'), isFalse);
+    });
+
+    test('denied opts the token out and holds it; provisional re-registers it',
         () async {
       final h = _Harness();
       final c = await h.start();
@@ -215,7 +310,6 @@ void main() {
       expect(h.identifies, [
         {
           'external_user_id': 'user_1',
-          'traits': {'push_permission': 'denied'},
           'channels': [
             {'channel': 'push', 'address': 'fcm_tok', 'opted_in': false}
           ],
@@ -226,6 +320,7 @@ void main() {
       h.identifies.clear();
       await c.setPushToken('fcm_tok', kind: WhisperrPushTokenKind.fcm);
       await c.identify('user_1', traits: {'plan': 'pro'});
+      await c.setPushPermission(WhisperrPushPermission.denied);
       await c.flush();
       expect(h.identifies, [
         {
@@ -241,7 +336,6 @@ void main() {
       expect(h.identifies, [
         {
           'external_user_id': 'user_1',
-          'traits': {'push_permission': 'provisional'},
           'channels': [
             {
               'channel': 'push',
@@ -253,50 +347,259 @@ void main() {
           ],
         }
       ]);
+      expect(h.permissionEvents.map((e) => e['properties']['status']),
+          ['authorized', 'denied', 'provisional']);
     });
 
-    test('before identify the status rides on it; the caller trait wins',
-        () async {
+    test('reset forgets the sent status but keeps the denied gate', () async {
       final h = _Harness();
       final c = await h.start();
+      await c.identify('user_1');
       await c.setPushPermission(WhisperrPushPermission.denied);
-      await c.identify('user_1');
-      await c.identify('user_2', traits: {'push_permission': 'custom'});
-      await c.flush();
-      expect(h.identifies[0]['traits'], {'push_permission': 'denied'});
-      expect(h.identifies[1]['traits'], {'push_permission': 'custom'});
-    });
-
-    test('after reset the next user gets the device status', () async {
-      final h = _Harness();
-      final c = await h.start();
-      await c.identify('user_1');
-      await c.setPushPermission(WhisperrPushPermission.granted);
       await c.reset();
       await c.identify('user_2');
+      await c.setPushToken('fcm_tok');
+      await c.setPushPermission(WhisperrPushPermission.denied);
       await c.flush();
-      expect(h.identifies.last['external_user_id'], 'user_2');
-      expect(h.identifies.last['traits'], {'push_permission': 'granted'});
+      expect(h.permissionEvents, [
+        {
+          'external_user_id': 'user_1',
+          'properties': {..._common, 'status': 'denied'},
+        },
+        {
+          'external_user_id': 'user_2',
+          'properties': {..._common, 'status': 'denied'},
+        },
+      ]);
+      expect(h.identifies.where((b) => b.containsKey('channels')), isEmpty);
     });
 
-    test('a report the server rejected is sent again', () async {
+    test('a 0.5.x record sends the event once and keeps its denied gate',
+        () async {
       final h = _Harness();
+      await h.persistence.save(
+          WhisperrPersistence.identitySlot, jsonEncode({'user_id': 'user_1'}));
+      await h.persistence.save(WhisperrPersistence.pushPermissionSlot,
+          jsonEncode({'status': 'denied', 'sent_for': 'user_1'}));
       final c = await h.start();
-      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.setPushPermission(WhisperrPushPermission.denied);
+      await c.setPushPermission(WhisperrPushPermission.denied);
       await c.flush();
-      h.status = 400;
-      await c.setPushPermission(WhisperrPushPermission.granted);
-      await c.flush();
+      expect(h.identifies, isEmpty);
+      expect(h.permissionEvents, [
+        {
+          'external_user_id': 'user_1',
+          'properties': {..._common, 'status': 'denied'},
+        },
+      ]);
+    });
+  });
+
+  group('optOut', () {
+    test('the opt-out identify survives a restart and is the only request',
+        () async {
+      final h = _Harness();
+      final first = await h.start();
+      await first.identify('user_1');
+      await first.setPushToken('fcm_tok');
+      await first.flush();
+      h.identifies.clear();
+      h.status = 503;
+      await first.track('pricing_viewed');
+      h.attempts.clear();
+      await first.optOut();
+      await first.track('paywall_viewed');
+      await first.flush();
+      h.expectOnlyPushOptOuts();
+      expect(first.pendingCount, 1);
+      await first.close();
+
       h.status = 200;
       h.identifies.clear();
-      await c.setPushPermission(WhisperrPushPermission.granted);
-      await c.flush();
+      final second = await h.start();
+      await second.track('pricing_viewed');
+      await second.setPushPermission(WhisperrPushPermission.denied);
+      await second.flush();
+      expect(second.isOptedOut, isTrue);
       expect(h.identifies, [
         {
           'external_user_id': 'user_1',
-          'traits': {'push_permission': 'granted'},
+          'channels': [
+            {'channel': 'push', 'address': 'fcm_tok', 'opted_in': false}
+          ],
         }
       ]);
+      expect(h.events, isEmpty);
+      expect(second.pendingCount, 0);
+      expect(h.attempts, isNotEmpty);
+      h.expectOnlyPushOptOuts();
+    });
+
+    test(
+        'after identify(other) without reset, opts the token out under its '
+        'own user', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.identify('user_2');
+      await c.flush();
+      h.identifies.clear();
+      await c.optOut();
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+    });
+
+    test('an opted-out install that still holds the pair opts it out once',
+        () async {
+      final h = _Harness();
+      await h.persistence.save(
+          WhisperrPersistence.identitySlot, jsonEncode({'user_id': 'user_1'}));
+      await h.persistence.save(WhisperrPersistence.pushSlot,
+          jsonEncode({'user_id': 'user_1', 'token': 'fcm_tok'}));
+      await h.persistence.save(WhisperrPersistence.optOutSlot, '1');
+      final first = await h.start();
+      await first.flush();
+      await first.close();
+      final second = await h.start();
+      await second.optOut();
+      await second.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+      expect(await h.persistence.load(WhisperrPersistence.pushSlot), isNull);
+    });
+
+    test('a restart while opted out keeps only the queued push opt-outs',
+        () async {
+      final h = _Harness();
+      await h.persistence.save(
+          WhisperrPersistence.queueSlot,
+          jsonEncode([
+            {
+              'id': 'op_1',
+              'kind': 'identify',
+              'body': {
+                'external_user_id': 'user_1',
+                'channels': [
+                  {'channel': 'email', 'address': 'a@b.co', 'opted_in': true},
+                  {'channel': 'push', 'address': 'fcm_old', 'opted_in': false},
+                ],
+              },
+            },
+          ]));
+      await h.persistence.save(WhisperrPersistence.optOutSlot, '1');
+      final c = await h.start();
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_old')]);
+      expect(c.pendingCount, 0);
+    });
+
+    test('keeps a denied-permission opt-out queued offline', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.flush();
+      h.identifies.clear();
+      h.status = 503;
+      await c.track('pricing_viewed');
+      await c.setPushPermission(WhisperrPushPermission.denied);
+      await c.flush();
+      await c.optOut();
+      h.status = 200;
+      h.events.clear();
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+      expect(h.events, isEmpty);
+    });
+
+    test('keeps the retirement of a rotation queued offline', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_a');
+      await c.flush();
+      h.identifies.clear();
+      h.status = 503;
+      await c.setPushToken('fcm_b');
+      await c.flush();
+      await c.optOut();
+      h.status = 200;
+      await c.flush();
+      expect(h.identifies, [
+        _pushOptOut('user_1', 'fcm_a'),
+        _pushOptOut('user_1', 'fcm_b'),
+      ]);
+    });
+
+    test('keeps an earlier opt-out that was not delivered yet', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.flush();
+      h.identifies.clear();
+      h.status = 503;
+      await c.optOut();
+      await c.flush();
+      await c.optIn();
+      await c.flush();
+      await c.optOut();
+      h.status = 200;
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+    });
+
+    test('keeps the retirement of an identify in flight that then gets a 4xx',
+        () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_a');
+      await c.flush();
+      h.identifies.clear();
+      final response = h.hold = Completer<int>();
+      await c.setPushToken('fcm_b');
+      await h.holding.future;
+      await c.optOut();
+      response.complete(400);
+      await c.flush();
+      await c.flush();
+      expect(h.identifies, [
+        _pushOptOut('user_1', 'fcm_a'),
+        _pushOptOut('user_1', 'fcm_b'),
+      ]);
+      expect(c.pendingCount, 0);
+    });
+
+    test('drops an opt-out that gets a 4xx', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.flush();
+      h.attempts.clear();
+      h.status = 400;
+      await c.optOut();
+      await c.flush();
+      expect(c.pendingCount, 0);
+      expect(h.attempts, hasLength(1));
+      h.expectOnlyPushOptOuts();
+    });
+
+    test('waits for start() to restore the pair', () async {
+      final h = _Harness()..persistence = _SlowLoads();
+      await h.persistence.save(
+          WhisperrPersistence.identitySlot, jsonEncode({'user_id': 'user_1'}));
+      await h.persistence.save(WhisperrPersistence.pushSlot,
+          jsonEncode({'user_id': 'user_1', 'token': 'fcm_tok'}));
+      final c = h.build();
+      final started = c.start();
+      await c.optOut();
+      await started;
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+      expect(await h.persistence.load(WhisperrPersistence.pushSlot), isNull);
     });
   });
 
@@ -338,3 +641,10 @@ void main() {
     });
   });
 }
+
+Map<String, Object?> _pushOptOut(String user, String token) => {
+      'external_user_id': user,
+      'channels': [
+        {'channel': 'push', 'address': token, 'opted_in': false}
+      ],
+    };

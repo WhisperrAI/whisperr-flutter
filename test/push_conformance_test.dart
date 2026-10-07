@@ -108,7 +108,16 @@ Future<void> _runCases(List<Map<String, dynamic>> cases) async {
         await client.flush();
         continue;
       }
-      if (step.containsKey('identify')) {
+      if (step.containsKey('optOut')) {
+        await client.optOut();
+      } else if (step.containsKey('optIn')) {
+        await client.optIn();
+      } else if (step.containsKey('pushPermission')) {
+        final value = step['pushPermission'] as String;
+        final status = WhisperrPushPermission.fromWire(value);
+        if (status == null) fail('${c['name']}: unknown status $value');
+        await client.setPushPermission(status);
+      } else if (step.containsKey('identify')) {
         final s = Map<String, dynamic>.from(step['identify'] as Map);
         await client.identify(
           s['externalUserId'] as String,

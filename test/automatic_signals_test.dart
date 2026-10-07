@@ -324,7 +324,7 @@ void main() {
   });
 
   group('opt-out', () {
-    test('setOptOut(true) clears the queue and stops all sending', () async {
+    test('optOut() clears the queue and stops all sending', () async {
       final h = _Harness()..status = 503;
       final client = h.client(automatic: false, maxRetries: 0);
       await client.start();
@@ -335,7 +335,7 @@ void main() {
       h.status = 202;
       h.requests.clear();
 
-      await client.setOptOut(true);
+      await client.optOut();
       expect(client.isOptedOut, isTrue);
       expect(client.pendingCount, 0);
 
@@ -359,7 +359,7 @@ void main() {
       final h = _Harness();
       final first = h.client(automatic: false);
       await first.start();
-      await first.setOptOut(true);
+      await first.optOut();
       await first.close();
 
       final second = h.client();
@@ -369,12 +369,26 @@ void main() {
       await second.flush();
       expect(h.requests, isEmpty);
 
-      await second.setOptOut(false);
+      await second.optIn();
       await second.track('pricing_viewed');
       await second.flush();
       await second.close();
       expect(h.eventTypes, ['pricing_viewed']);
     });
+  });
+
+  test('the deprecated setOptOut(bool) maps to optOut() and optIn()',
+      () async {
+    final h = _Harness();
+    final client = h.client(automatic: false);
+    await client.start();
+    // ignore: deprecated_member_use_from_same_package
+    await client.setOptOut(true);
+    expect(client.isOptedOut, isTrue);
+    // ignore: deprecated_member_use_from_same_package
+    await client.setOptOut(false);
+    expect(client.isOptedOut, isFalse);
+    await client.close();
   });
 
   group('Retry-After', () {
@@ -437,7 +451,7 @@ void main() {
       // First attempt + one retry; the retry limit is not extended.
       expect(h.requests, hasLength(2));
       expect(client.pendingCount, 1);
-      await client.setOptOut(true); // stop further retries before close
+      await client.optOut(); // stop further retries before close
       await client.close();
     });
   });
