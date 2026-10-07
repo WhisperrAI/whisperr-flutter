@@ -92,6 +92,17 @@ class _Harness {
 
   List<Map<String, dynamic>> get pushOpens =>
       events.where((e) => e['event_type'] == 'push_opened').toList();
+
+  /// The `status` / `previous_status` of each `push_permission_changed`.
+  List<Map<String, dynamic>> get permissionReports => [
+        for (final e in events)
+          if (e['event_type'] == 'push_permission_changed')
+            {
+              for (final key in ['status', 'previous_status'])
+                if ((e['properties'] as Map)[key] != null)
+                  key: (e['properties'] as Map)[key],
+            },
+      ];
 }
 
 RemoteMessage _message(String id, Map<String, dynamic> data) =>
@@ -131,11 +142,10 @@ void main() {
       expect(reg.permission, WhisperrPushPermission.granted);
       expect(reg.token, 'fcm_tok_1');
       expect(messaging.requests.single[#provisional], false);
+      expect(h.permissionReports, [
+        {'status': 'authorized'}
+      ]);
       expect(h.identifies, [
-        {
-          'external_user_id': 'user_1',
-          'traits': {'push_permission': 'granted'},
-        },
         {
           'external_user_id': 'user_1',
           'channels': [
@@ -184,12 +194,10 @@ void main() {
       await client.flush();
       expect(reg.permission, WhisperrPushPermission.denied);
       expect(reg.token, isNull);
-      expect(h.identifies, [
-        {
-          'external_user_id': 'user_1',
-          'traits': {'push_permission': 'denied'},
-        }
+      expect(h.permissionReports, [
+        {'status': 'denied'}
       ]);
+      expect(h.identifies, isEmpty);
     });
 
     test('requestPermission: false only reads the permission', () async {
@@ -227,7 +235,6 @@ void main() {
       expect(h.identifies, [
         {
           'external_user_id': 'user_1',
-          'traits': {'push_permission': 'denied'},
           'channels': [
             {'channel': 'push', 'address': 'fcm_tok_1', 'opted_in': false}
           ],
@@ -237,9 +244,13 @@ void main() {
       h.identifies.clear();
       messaging.status = AuthorizationStatus.authorized;
       await resume();
-      expect(h.identifies.single['traits'], {'push_permission': 'granted'});
       expect((h.identifies.single['channels'] as List).single,
           containsPair('opted_in', true));
+      expect(h.permissionReports, [
+        {'status': 'authorized'},
+        {'status': 'denied', 'previous_status': 'authorized'},
+        {'status': 'authorized', 'previous_status': 'denied'},
+      ]);
     });
 
     test('iOS with useApnsToken registers the APNs token with push_env',

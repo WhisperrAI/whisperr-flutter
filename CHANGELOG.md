@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- **`setPushPermission` sends the event `push_permission_changed`.** The
+  event has `status` (`authorized`, `provisional`, `denied`,
+  `not_determined`) and `previous_status` when the status changed. Before,
+  the SDK sent the identify trait `push_permission` with other values
+  (`granted`, `undetermined`), and the engine did not read it. The SDK no
+  longer sends the trait.
+  - `WhisperrPushPermission` keeps its values. `granted` goes out as
+    `authorized` and `undetermined` as `not_determined`.
+    `WhisperrPushPermission.wireValue` now returns these event values.
+  - The SDK stores the last status it sent on this device and sends a status
+    only when it changed. `reset()` forgets it. Before login, the event goes
+    out under the `anonymous_id`. The event goes out also when automatic
+    events are off.
+  - After an upgrade from 0.5.x, the first report sends the event once, with
+    no `previous_status`.
+  - `denied` still opts out this device's push token and holds it. The
+    identify for this now carries only `external_user_id` and `channels`.
+- **`optOut()` and `optIn()`.** `optOut()` now tells the server about this
+  device. When a user is known and the SDK registered a push token for that
+  user, it sends one identify that opts the token out. The SDK delivers and
+  retries this request also while opted out and after a restart. `optOut()`
+  forgets the last-sent token, so after `optIn()` the next `setPushToken`
+  registers it again.
+- **Deprecated: `setOptOut(bool)`.** It calls `optOut()` or `optIn()`.
+- Tests run every case of whisperr-spec `conformance/automatic.json`.
+
 ## 0.5.0
 
 - **Push token kinds** (whisperr-spec `push.json` `kindCases`):

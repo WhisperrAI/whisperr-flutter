@@ -124,8 +124,8 @@ know:
 
 ### Permission
 
-Report the OS notification permission on every launch and every resume. A
-repeated status is a no-op.
+Report the OS notification permission on every launch and every resume. The
+SDK sends a status only when it changed.
 
 ```dart
 WhisperrPushPermission toWhisperr(AuthorizationStatus status) =>
@@ -141,11 +141,17 @@ await Whisperr.instance
     .setPushPermission(toWhisperr(settings.authorizationStatus));
 ```
 
-- The user gets the trait `push_permission`.
+- The SDK sends the event `push_permission_changed` with `status`
+  (`authorized`, `provisional`, `denied` or `not_determined`). When the
+  status changed, `previous_status` holds the status sent before.
+- The SDK stores the last status it sent on this device. The same status is
+  not sent again, also after a restart. `reset()` forgets it, so the next user
+  gets a new report.
+- Before login, the event goes out under the device's `anonymousId`.
+- The event goes out also when automatic events are off.
 - `denied` opts this device's token out, so the engine does not choose push
   for it. While the status is `denied`, `setPushToken` holds the token back.
   When you report `granted` or `provisional` again, the SDK registers it again.
-- Before login, the status goes with the next `identify()`.
 
 ### Push opens
 
@@ -219,11 +225,22 @@ await Whisperr.instance.reset(flushBeforeReset: false); // clears identity local
 ## Opt-out
 
 ```dart
-await Whisperr.instance.setOptOut(true);  // deletes the queue, sends nothing
-await Whisperr.instance.setOptOut(false); // sends again
+await Whisperr.instance.optOut(); // deletes the queue, then sends nothing
+await Whisperr.instance.optIn();  // sends again
 ```
 
-The choice is persisted across restarts.
+- `optOut()` tells the server to stop push to this device. When a user is
+  known and the SDK registered a push token for that user, it sends one
+  identify that opts the token out (`opted_in: false`). The SDK delivers and
+  retries this request like any queued call, also after a restart.
+- After that, the SDK sends nothing until `optIn()`. It drops a buffered push
+  token.
+- After `optIn()`, the next `setPushToken` registers the token again.
+- Email, SMS and the user's other devices keep their state. Data already sent
+  stays on the server.
+- The choice is persisted across restarts and kept across `reset()`.
+- `setOptOut(bool)` still works. It is deprecated: use `optOut()` and
+  `optIn()`.
 
 ## How delivery works
 

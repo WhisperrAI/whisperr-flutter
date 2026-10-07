@@ -42,20 +42,22 @@ enum WhisperrPushEnvironment {
 
 /// The notification permission the OS reports for this app.
 enum WhisperrPushPermission {
-  /// Notifications show.
-  granted,
+  /// Notifications show. Sent as `authorized`.
+  granted('authorized'),
 
   /// iOS quiet delivery: notifications go to Notification Center only.
-  provisional,
+  provisional('provisional'),
 
   /// The user turned notifications off.
-  denied,
+  denied('denied'),
 
-  /// The app has not asked yet.
-  undetermined;
+  /// The app has not asked yet. Sent as `not_determined`.
+  undetermined('not_determined');
 
-  /// The value sent as the `push_permission` trait.
-  String get wireValue => name;
+  const WhisperrPushPermission(this.wireValue);
+
+  /// The `status` value of the `push_permission_changed` event.
+  final String wireValue;
 
   /// Whether the OS shows (or quietly delivers) notifications.
   bool get allowsPush => this == granted || this == provisional;
@@ -67,6 +69,41 @@ enum WhisperrPushPermission {
     }
     return null;
   }
+}
+
+/// The notification permission state this device keeps, persisted next to
+/// the queue.
+class WhisperrPermissionRecord {
+  const WhisperrPermissionRecord({this.current, this.sent});
+
+  /// Reads a stored record. A 0.5.x record (`{status, sent_for}`) carried the
+  /// trait and never sent the event: its status stays the device's current
+  /// permission, and nothing counts as sent.
+  factory WhisperrPermissionRecord.fromJson(Map<dynamic, dynamic> json) {
+    if (!json.containsKey('current') && !json.containsKey('sent')) {
+      return WhisperrPermissionRecord(
+          current: WhisperrPushPermission.values.asNameMap()[json['status']]);
+    }
+    return WhisperrPermissionRecord(
+      current: WhisperrPushPermission.fromWire(json['current']),
+      sent: WhisperrPushPermission.fromWire(json['sent']),
+    );
+  }
+
+  /// The status the app last reported. While it is denied, this device's
+  /// push token is held back.
+  final WhisperrPushPermission? current;
+
+  /// The status last sent as `push_permission_changed` from this device.
+  /// Null when none was sent since install or the last reset().
+  final WhisperrPushPermission? sent;
+
+  bool get isEmpty => current == null && sent == null;
+
+  Map<String, dynamic> toJson() => {
+        if (current != null) 'current': current!.wireValue,
+        if (sent != null) 'sent': sent!.wireValue,
+      };
 }
 
 /// A tap on a Whisperr push: the message id and the deep link, if any.
@@ -216,6 +253,7 @@ class WhisperrQueueOp {
     required this.id,
     required this.kind,
     required this.body,
+    this.optOut = false,
   });
 
   factory WhisperrQueueOp.fromJson(Map<String, dynamic> json) =>
@@ -223,15 +261,21 @@ class WhisperrQueueOp {
         id: json['id'] as String,
         kind: WhisperrOpKind.values.byName(json['kind'] as String),
         body: Map<String, dynamic>.from(json['body'] as Map),
+        optOut: json['opt_out'] == true,
       );
 
   final String id;
   final WhisperrOpKind kind;
   final Map<String, dynamic> body;
 
+  /// The identify that `optOut()` queues to opt this device's push token
+  /// out. The only op delivered while the device is opted out.
+  final bool optOut;
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'kind': kind.name,
         'body': body,
+        if (optOut) 'opt_out': true,
       };
 }

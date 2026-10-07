@@ -29,14 +29,15 @@ abstract class WhisperrPersistence {
   /// `app_installed` / `app_updated`.
   static const String appSlot = 'app';
 
-  /// The persisted opt-out flag set by `setOptOut`.
+  /// The persisted opt-out flag set by `optOut()`.
   static const String optOutSlot = 'opt_out';
 
   /// Recent `whisperr_message_id`s already reported as `push_opened`.
   static const String pushOpenedSlot = 'push_opened';
 
-  /// The last notification permission reported through `setPushPermission`,
-  /// and the user it was sent for.
+  /// The notification permission record: the status last reported through
+  /// `setPushPermission`, and the status last sent as
+  /// `push_permission_changed`.
   static const String pushPermissionSlot = 'push_permission';
 
   Future<String?> load(String slot);

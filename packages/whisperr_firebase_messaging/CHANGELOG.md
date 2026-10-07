@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The permission report now reaches Whisperr as the event
+  `push_permission_changed` (`authorized`, `provisional`, `denied`,
+  `not_determined`), not as the trait `push_permission`. This comes from the
+  `whisperr` core. This package does not change. Use it with the `whisperr`
+  release that ships this change.
+
 ## 0.1.0
 
 First release.
