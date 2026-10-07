@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Removed: the identify trait `push_permission`.** `setPushPermission()` no
+  longer writes it. An app or a dashboard filter that reads this trait gets no
+  new values. Use the event `push_permission_changed` (below) instead.
+- **Push permission and the token** (whisperr-spec SPEC.md "Push permission
+  and the token"): `denied` opts this device's push token out and holds it.
+  A token set while `denied` is held, not sent. `granted` or `provisional`
+  opts the held token back in. When this token was the user's only opted-in
+  channel, the server marks the user suppressed (`all_channels_opted_out`)
+  until a channel is opted in again.
 - **`setPushPermission` sends the event `push_permission_changed`.** The
   event has `status` (`authorized`, `provisional`, `denied`,
   `not_determined`) and `previous_status` when the status changed. Before,
