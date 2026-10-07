@@ -268,8 +268,8 @@ class WhisperrQueueOp {
   final WhisperrOpKind kind;
   final Map<String, dynamic> body;
 
-  /// The identify that `optOut()` queues to opt this device's push token
-  /// out. The only op delivered while the device is opted out.
+  /// A push opt-out kept or queued by `optOut()`. The only kind of op
+  /// delivered while the device is opted out.
   final bool optOut;
 
   Map<String, dynamic> toJson() => {

@@ -229,10 +229,13 @@ await Whisperr.instance.optOut(); // deletes the queue, then sends nothing
 await Whisperr.instance.optIn();  // sends again
 ```
 
-- `optOut()` tells the server to stop push to this device. When a user is
-  known and the SDK registered a push token for that user, it sends one
-  identify that opts the token out (`opted_in: false`). The SDK delivers and
-  retries this request like any queued call, also after a restart.
+- `optOut()` tells the server to stop push to this device. When the SDK
+  registered a push token, it sends one identify that opts the token out
+  (`opted_in: false`) under the user it was registered for. That user can
+  differ from the current user, for example after `identify(userB)` without
+  `reset()`. Push opt-outs already queued (a token rotation, a denied
+  permission) stay queued ahead of it. The SDK delivers and retries these
+  requests like any queued call, also after a restart.
 - After that, the SDK sends nothing until `optIn()`. It drops a buffered push
   token.
 - After `optIn()`, the next `setPushToken` registers the token again.

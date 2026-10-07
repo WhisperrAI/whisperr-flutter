@@ -17,21 +17,33 @@ const _common = <String, Object?>{
   'platform': 'ios',
 };
 
+/// Storage whose reads finish a timer tick later, like a first disk read.
+class _SlowLoads extends InMemoryPersistence {
+  @override
+  Future<String?> load(String slot) async {
+    await Future<void>.delayed(Duration.zero);
+    return super.load(slot);
+  }
+}
+
 class _Harness {
   _Harness() {
     mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      if (req.url.path == '/v1/identify') identifies.add(body);
-      if (req.url.path == '/v1/events/batch') {
+      if (status == 200 && req.url.path == '/v1/identify') {
+        identifies.add(body);
+      }
+      if (status == 200 && req.url.path == '/v1/events/batch') {
         events.addAll((body['events'] as List).cast<Map<String, dynamic>>());
       }
       return http.Response('{}', status);
     });
   }
 
+  /// The identify bodies and events the server accepted.
   final identifies = <Map<String, dynamic>>[];
   final events = <Map<String, dynamic>>[];
-  final persistence = InMemoryPersistence();
+  WhisperrPersistence persistence = InMemoryPersistence();
   int status = 200;
   late final MockClient mock;
 
@@ -46,6 +58,12 @@ class _Harness {
       ];
 
   Future<WhisperrClient> start() async {
+    final client = build();
+    await client.start();
+    return client;
+  }
+
+  WhisperrClient build() {
     final client = WhisperrClient(
       apiClient: WhisperrApiClient(
         httpClient: mock,
@@ -67,7 +85,6 @@ class _Harness {
       appContext: () async => const <String, Object?>{'platform': 'ios'},
     );
     addTearDown(client.close);
-    await client.start();
     return client;
   }
 }
@@ -380,6 +397,135 @@ void main() {
       expect(h.events, isEmpty);
       expect(second.pendingCount, 0);
     });
+
+    test(
+        'after identify(other) without reset, opts the token out under its '
+        'own user', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.identify('user_2');
+      await c.flush();
+      h.identifies.clear();
+      await c.optOut();
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+    });
+
+    test('an opted-out install that still holds the pair opts it out once',
+        () async {
+      final h = _Harness();
+      await h.persistence.save(
+          WhisperrPersistence.identitySlot, jsonEncode({'user_id': 'user_1'}));
+      await h.persistence.save(WhisperrPersistence.pushSlot,
+          jsonEncode({'user_id': 'user_1', 'token': 'fcm_tok'}));
+      await h.persistence.save(WhisperrPersistence.optOutSlot, '1');
+      final first = await h.start();
+      await first.flush();
+      await first.close();
+      final second = await h.start();
+      await second.optOut();
+      await second.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+      expect(await h.persistence.load(WhisperrPersistence.pushSlot), isNull);
+    });
+
+    test('a restart while opted out keeps only the queued push opt-outs',
+        () async {
+      final h = _Harness();
+      await h.persistence.save(
+          WhisperrPersistence.queueSlot,
+          jsonEncode([
+            {
+              'id': 'op_1',
+              'kind': 'identify',
+              'body': {
+                'external_user_id': 'user_1',
+                'channels': [
+                  {'channel': 'email', 'address': 'a@b.co', 'opted_in': true},
+                  {'channel': 'push', 'address': 'fcm_old', 'opted_in': false},
+                ],
+              },
+            },
+          ]));
+      await h.persistence.save(WhisperrPersistence.optOutSlot, '1');
+      final c = await h.start();
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_old')]);
+      expect(c.pendingCount, 0);
+    });
+
+    test('keeps a denied-permission opt-out queued offline', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.flush();
+      h.identifies.clear();
+      h.status = 503;
+      await c.track('pricing_viewed');
+      await c.setPushPermission(WhisperrPushPermission.denied);
+      await c.flush();
+      await c.optOut();
+      h.status = 200;
+      h.events.clear();
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+      expect(h.events, isEmpty);
+    });
+
+    test('keeps the retirement of a rotation queued offline', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_a');
+      await c.flush();
+      h.identifies.clear();
+      h.status = 503;
+      await c.setPushToken('fcm_b');
+      await c.flush();
+      await c.optOut();
+      h.status = 200;
+      await c.flush();
+      expect(h.identifies, [
+        _pushOptOut('user_1', 'fcm_a'),
+        _pushOptOut('user_1', 'fcm_b'),
+      ]);
+    });
+
+    test('keeps an earlier opt-out that was not delivered yet', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.flush();
+      h.identifies.clear();
+      h.status = 503;
+      await c.optOut();
+      await c.flush();
+      await c.optIn();
+      await c.flush();
+      await c.optOut();
+      h.status = 200;
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+    });
+
+    test('waits for start() to restore the pair', () async {
+      final h = _Harness()..persistence = _SlowLoads();
+      await h.persistence.save(
+          WhisperrPersistence.identitySlot, jsonEncode({'user_id': 'user_1'}));
+      await h.persistence.save(WhisperrPersistence.pushSlot,
+          jsonEncode({'user_id': 'user_1', 'token': 'fcm_tok'}));
+      final c = h.build();
+      final started = c.start();
+      await c.optOut();
+      await started;
+      await c.flush();
+      expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+      expect(await h.persistence.load(WhisperrPersistence.pushSlot), isNull);
+    });
   });
 
   group('push opens', () {
@@ -420,3 +566,10 @@ void main() {
     });
   });
 }
+
+Map<String, Object?> _pushOptOut(String user, String token) => {
+      'external_user_id': user,
+      'channels': [
+        {'channel': 'push', 'address': token, 'opted_in': false}
+      ],
+    };

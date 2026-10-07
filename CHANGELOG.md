@@ -20,11 +20,15 @@
   - `denied` still opts out this device's push token and holds it. The
     identify for this now carries only `external_user_id` and `channels`.
 - **`optOut()` and `optIn()`.** `optOut()` now tells the server about this
-  device. When a user is known and the SDK registered a push token for that
-  user, it sends one identify that opts the token out. The SDK delivers and
-  retries this request also while opted out and after a restart. `optOut()`
-  forgets the last-sent token, so after `optIn()` the next `setPushToken`
-  registers it again.
+  device. When the SDK registered a push token, it sends one identify that
+  opts the token out, under the user the token was registered for. Push
+  opt-outs already queued (a rotation, a denied permission, an earlier
+  `optOut()`) stay queued ahead of it. The SDK delivers and retries these
+  requests also while opted out and after a restart. `optOut()` forgets the
+  last-sent token, so after `optIn()` the next `setPushToken` registers it
+  again.
+  - An install that a 0.5.x SDK opted out still holds the last-sent token.
+    At start, the SDK sends the same opt-out once and forgets the token.
 - **Deprecated: `setOptOut(bool)`.** It calls `optOut()` or `optIn()`.
 - Tests run every case of whisperr-spec `conformance/automatic.json`.
 

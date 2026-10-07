@@ -112,6 +112,8 @@ class WhisperrClient {
   bool _coldOpenPending = false;
   DateTime? _foregroundSince;
   bool _started = false;
+  /// Set by [start]; [optOut] waits for it so it sees the restored pair.
+  Future<bool>? _restoring;
   bool _closed = false;
   int _seq = 0;
 
@@ -138,7 +140,8 @@ class WhisperrClient {
     if (_started) return;
     _started = true;
 
-    final hadPriorState = await _restore();
+    final restoring = _restoring = _restore();
+    final hadPriorState = await restoring;
 
     _timer = Timer.periodic(_options.flushInterval, (_) => unawaited(flush()));
 
@@ -680,45 +683,62 @@ class WhisperrClient {
   /// opting back in attributes new events correctly. The choice is persisted
   /// and kept across [reset].
   ///
-  /// When a user is known and this client registered a push token for them,
-  /// one identify opts that token out (`opted_in: false`), so the server
-  /// stops push to this device. It is delivered and retried like any queued
-  /// call, also across restarts. Email, SMS and the user's other devices keep
-  /// their state, and data already sent is not deleted.
+  /// When this client registered a push token, one identify opts that token
+  /// out (`opted_in: false`) under the user it was registered for, so the
+  /// server stops push to this device. Push opt-outs already queued (a
+  /// rotation, a denied permission) are kept ahead of it. They are delivered
+  /// and retried like any queued call, also across restarts. Email, SMS and
+  /// the user's other devices keep their state, and data already sent is not
+  /// deleted.
   Future<void> optOut() => _mutateIdentity(_optOut);
 
   Future<void> _optOut() async {
     _ensureUsable();
+    await _restoring;
     if (_optedOut) return;
-    // Read the token before the queue is cleared.
-    final uid = _currentUserId;
-    final token = uid != null && _lastPushUserId == uid ? _lastPushToken : null;
     _optedOut = true;
-    await _persistOptOut();
     _pendingPushToken = null;
-    _lastPushUserId = null;
-    _lastPushToken = null;
-    _lastPushMeta = null;
-    await _persistPushState();
+    await _persistOptOut();
     await _mutateQueue(() async {
-      final next = [
-        if (uid != null && token != null)
-          WhisperrQueueOp(
-            id: _nextId(),
-            kind: WhisperrOpKind.identify,
-            optOut: true,
-            body: {
-              'external_user_id': uid,
-              'channels': [WhisperrChannel.push(token, optedIn: false).toJson()],
-            },
-          ),
-      ];
+      final next = _optOutQueue();
       await _persistQueue(next);
       _queue
         ..clear()
         ..addAll(next);
     });
+    await _persistPushState();
     unawaited(flush());
+  }
+
+  /// The queue that stays while opted out: the push opt-outs already queued,
+  /// then the opt-out of the last-sent pair (see [_takePushOptOut]).
+  List<WhisperrQueueOp> _optOutQueue() {
+    final optOut = _takePushOptOut();
+    return [
+      ..._queue.map(_pushRetirements).nonNulls,
+      if (optOut != null) optOut,
+    ];
+  }
+
+  /// The identify that opts this device's last-sent push token out, under
+  /// the user it was sent for. Forgets the pair, so the token registers
+  /// again after [optIn].
+  WhisperrQueueOp? _takePushOptOut() {
+    final uid = _lastPushUserId;
+    final token = _lastPushToken;
+    _lastPushUserId = null;
+    _lastPushToken = null;
+    _lastPushMeta = null;
+    if (uid == null || token == null) return null;
+    return WhisperrQueueOp(
+      id: _nextId(),
+      kind: WhisperrOpKind.identify,
+      optOut: true,
+      body: {
+        'external_user_id': uid,
+        'channels': [WhisperrChannel.push(token, optedIn: false).toJson()],
+      },
+    );
   }
 
   /// Resumes sending after [optOut]. The next [setPushToken] registers the
@@ -1056,8 +1076,8 @@ class WhisperrClient {
     }
   }
 
-  /// Whether the queue head may go out: anything while opted in, only the
-  /// opt-out identify while opted out.
+  /// Whether the queue head may go out: anything while opted in, only push
+  /// opt-outs while opted out.
   bool get _headDeliverable =>
       _queue.isNotEmpty && (!_optedOut || _queue.first.optOut);
 
@@ -1262,14 +1282,15 @@ class WhisperrClient {
     } catch (e) {
       _log('failed to restore push-opened ids ($e)');
     }
-    if (_optedOut && _queue.any((op) => !op.optOut)) {
-      // Opted out while a queue write was racing: never send it. The opt-out
-      // identify itself still goes out.
-      final kept = _queue.where((op) => op.optOut).toList();
+    if (_optedOut) {
+      // Keep only push opt-outs: a queue write may have raced optOut(), and
+      // an older SDK (or a crash inside optOut()) may have left the pair.
+      final kept = _optOutQueue();
       _queue
         ..clear()
         ..addAll(kept);
       await _persistQueue(kept);
+      await _persistPushState();
     }
     return _queue.isNotEmpty ||
         _currentUserId != null ||
@@ -1458,4 +1479,23 @@ class Whisperr {
     await _instance?.close();
     _instance = null;
   }
+}
+
+/// [op] cut down to its push opt-outs (a rotation, a denied permission, an
+/// earlier opt-out), marked to go out while opted out; null when it retires
+/// no token.
+WhisperrQueueOp? _pushRetirements(WhisperrQueueOp op) {
+  final channels = op.body['channels'];
+  if (op.kind != WhisperrOpKind.identify || channels is! List) return null;
+  final retired = [
+    for (final c in channels)
+      if (c is Map && c['channel'] == 'push' && c['opted_in'] == false) c,
+  ];
+  if (retired.isEmpty) return null;
+  return WhisperrQueueOp(
+    id: op.id,
+    kind: WhisperrOpKind.identify,
+    optOut: true,
+    body: {'external_user_id': op.body['external_user_id'], 'channels': retired},
+  );
 }
