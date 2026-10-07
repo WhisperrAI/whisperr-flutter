@@ -1114,7 +1114,11 @@ class WhisperrClient {
           _log('dropping op after permanent client error ($e)');
           // Overflow may already have evicted this request and cleared its
           // push mark. Do not clear a newer registration's mark a second time.
-          final discarded = _queue.where((op) => op.id == head.id).toList();
+          // The push opt-outs that optOut() cut from this request share its
+          // id but were not sent; they stay.
+          final discarded = _queue
+              .where((op) => op.id == head.id && op.optOut == head.optOut)
+              .toList();
           await _forgetPushMark(discarded);
           await _removeQueuedOps(discarded);
           continue;

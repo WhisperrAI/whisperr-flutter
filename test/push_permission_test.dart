@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -30,15 +31,29 @@ class _Harness {
   _Harness() {
     mock = MockClient((req) async {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
-      if (status == 200 && req.url.path == '/v1/identify') {
+      attempts.add((path: req.url.path, body: body));
+      // A drain that resends forever never yields to a timer, so a test
+      // timeout cannot stop it.
+      if (attempts.length > 50) throw StateError('request loop');
+      var code = status;
+      final held = hold;
+      if (held != null) {
+        hold = null;
+        holding.complete();
+        code = await held.future;
+      }
+      if (code == 200 && req.url.path == '/v1/identify') {
         identifies.add(body);
       }
-      if (status == 200 && req.url.path == '/v1/events/batch') {
+      if (code == 200 && req.url.path == '/v1/events/batch') {
         events.addAll((body['events'] as List).cast<Map<String, dynamic>>());
       }
-      return http.Response('{}', status);
+      return http.Response('{}', code);
     });
   }
+
+  /// Every request sent, whatever the answer.
+  final attempts = <({String path, Map<String, dynamic> body})>[];
 
   /// The identify bodies and events the server accepted.
   final identifies = <Map<String, dynamic>>[];
@@ -46,6 +61,24 @@ class _Harness {
   WhisperrPersistence persistence = InMemoryPersistence();
   int status = 200;
   late final MockClient mock;
+
+  /// When set, the next request waits for it and answers with its status.
+  Completer<int>? hold;
+
+  /// Completes when the held request reaches the server.
+  final holding = Completer<void>();
+
+  /// Every attempt so far was an identify that only opts push tokens out.
+  void expectOnlyPushOptOuts() {
+    for (final a in attempts) {
+      expect(a.path, '/v1/identify');
+      expect(a.body.keys, unorderedEquals(['external_user_id', 'channels']));
+      for (final c in a.body['channels'] as List) {
+        expect(c,
+            {'channel': 'push', 'address': isA<String>(), 'opted_in': false});
+      }
+    }
+  }
 
   List<Map<String, dynamic>> get permissionEvents => [
         for (final e in events)
@@ -374,8 +407,11 @@ void main() {
       h.identifies.clear();
       h.status = 503;
       await first.track('pricing_viewed');
+      h.attempts.clear();
       await first.optOut();
+      await first.track('paywall_viewed');
       await first.flush();
+      h.expectOnlyPushOptOuts();
       expect(first.pendingCount, 1);
       await first.close();
 
@@ -396,6 +432,8 @@ void main() {
       ]);
       expect(h.events, isEmpty);
       expect(second.pendingCount, 0);
+      expect(h.attempts, isNotEmpty);
+      h.expectOnlyPushOptOuts();
     });
 
     test(
@@ -510,6 +548,43 @@ void main() {
       h.status = 200;
       await c.flush();
       expect(h.identifies, [_pushOptOut('user_1', 'fcm_tok')]);
+    });
+
+    test('keeps the retirement of an identify in flight that then gets a 4xx',
+        () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_a');
+      await c.flush();
+      h.identifies.clear();
+      final response = h.hold = Completer<int>();
+      await c.setPushToken('fcm_b');
+      await h.holding.future;
+      await c.optOut();
+      response.complete(400);
+      await c.flush();
+      await c.flush();
+      expect(h.identifies, [
+        _pushOptOut('user_1', 'fcm_a'),
+        _pushOptOut('user_1', 'fcm_b'),
+      ]);
+      expect(c.pendingCount, 0);
+    });
+
+    test('drops an opt-out that gets a 4xx', () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.identify('user_1');
+      await c.setPushToken('fcm_tok');
+      await c.flush();
+      h.attempts.clear();
+      h.status = 400;
+      await c.optOut();
+      await c.flush();
+      expect(c.pendingCount, 0);
+      expect(h.attempts, hasLength(1));
+      h.expectOnlyPushOptOuts();
     });
 
     test('waits for start() to restore the pair', () async {
