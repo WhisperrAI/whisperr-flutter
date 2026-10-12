@@ -16,6 +16,8 @@ const _common = <String, Object?>{
   'sdk_name': 'whisperr-flutter',
   'sdk_version': kWhisperrSdkVersion,
   'platform': 'ios',
+  // The SDK fills os_name from the platform when the app context has none.
+  'os_name': 'ios',
 };
 
 /// Storage whose reads finish a timer tick later, like a first disk read.

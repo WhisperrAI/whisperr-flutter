@@ -247,26 +247,24 @@ class _Matcher {
   }
 }
 
-/// The requests a case sent, minus `push_permission_changed` events.
-///
-/// The v2 `anonymousPush` cases with a `pushPermission` step list only the
-/// identify requests, but SPEC.md (Push permission) sends that event on every
-/// change, also with automatic events off. Reported to the spec owner; this
-/// filter goes when the fixtures list the event.
-List<Map<String, dynamic>> _sent(_Case c) {
+/// The identify bodies a case sent, in order.
+List<Map<String, dynamic>> _identifies(_Case c) => [
+      for (final r in c.requests)
+        if (r.url.path == '/v1/identify')
+          jsonDecode(r.body) as Map<String, dynamic>,
+    ];
+
+/// The events a case sent, in order (a /v1/events/track request is a batch
+/// of one).
+List<Map<String, dynamic>> _events(_Case c) {
   final out = <Map<String, dynamic>>[];
   for (final r in c.requests) {
     final body = jsonDecode(r.body) as Map<String, dynamic>;
-    if (r.url.path == '/v1/identify') {
-      out.add({'endpoint': '/v1/identify', 'body': body});
-      continue;
+    if (r.url.path == '/v1/events/batch') {
+      out.addAll((body['events'] as List).cast<Map<String, dynamic>>());
+    } else if (r.url.path == '/v1/events/track') {
+      out.add(body);
     }
-    final events = (body['events'] as List)
-        .cast<Map<String, dynamic>>()
-        .where((e) => e['event_type'] != 'push_permission_changed')
-        .toList();
-    if (events.isEmpty) continue;
-    out.add({'endpoint': r.url.path, 'events': events});
   }
   return out;
 }
@@ -283,29 +281,52 @@ void main() {
       for (final raw in cases) {
         final c = _Case(section, raw);
         await _run(c);
-        final sent = _sent(c);
         final expected =
             (raw['expectedRequests'] as List).cast<Map<String, dynamic>>();
-        expect(sent.map((r) => r['endpoint']).toList(),
-            expected.map((r) => r['endpoint']).toList(),
-            reason: '${c.name}: requests ${jsonEncode(sent)}');
         final m = _Matcher(c.name);
-        for (var i = 0; i < expected.length; i++) {
-          final want = expected[i];
-          final where = '${c.name} request[$i]';
-          if (want['endpoint'] == '/v1/identify') {
-            final body = sent[i]['body'] as Map<String, dynamic>;
-            final wantBody = Map<String, dynamic>.from(want['body'] as Map);
-            m.check(wantBody, withoutUnnamedAnonymousId(body, wantBody),
-                '$where.body');
+
+        // Comparison is per endpoint: identify bodies and events are two
+        // ordered lists; the order between them is not compared.
+        final identifies = _identifies(c);
+        final wantIdentifies = [
+          for (final r in expected)
+            if (r['endpoint'] == '/v1/identify')
+              Map<String, dynamic>.from(r['body'] as Map),
+        ];
+        expect(identifies.length, wantIdentifies.length,
+            reason: '${c.name}: identifies ${jsonEncode(identifies)}');
+        for (var i = 0; i < wantIdentifies.length; i++) {
+          m.check(
+              wantIdentifies[i],
+              withoutUnnamedAnonymousId(identifies[i], wantIdentifies[i]),
+              '${c.name} identify[$i]');
+        }
+
+        final events = _events(c);
+        final wantEvents = [
+          for (final r in expected)
+            if (r['endpoint'] != '/v1/identify')
+              for (final e in r['events'] as List)
+                Map<String, dynamic>.from(e as Map),
+        ];
+        expect(events.length, wantEvents.length,
+            reason: '${c.name}: events ${jsonEncode(events)}');
+        for (var i = 0; i < wantEvents.length; i++) {
+          final where = '${c.name} event[$i]';
+          if (wantEvents[i]['event_type'] == 'push_permission_changed') {
+            // Compared as automatic.json does: event_type and properties,
+            // without identity fields, occurred_at and context.
+            expect((events[i]['context'] as Map)[r'$message_id'], isNotNull,
+                reason: '$where context.\$message_id');
+            m.check(
+                wantEvents[i],
+                {
+                  'event_type': events[i]['event_type'],
+                  'properties': events[i]['properties'],
+                },
+                where);
           } else {
-            final events = sent[i]['events'] as List;
-            final wantEvents = want['events'] as List;
-            expect(events.length, wantEvents.length, reason: where);
-            for (var j = 0; j < wantEvents.length; j++) {
-              m.event(wantEvents[j] as Map, events[j] as Map<String, dynamic>,
-                  '$where.events[$j]');
-            }
+            m.event(wantEvents[i], events[i], where);
           }
         }
       }

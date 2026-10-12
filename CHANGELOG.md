@@ -63,12 +63,15 @@ anonymous identify and the new push token fields with `400`.
   `sdk_version` in `context`. No value, no key. A key the caller passes in
   `context` wins. The SDK never puts `locale` in context. `client_app_id` is
   never an event property.
+- Automatic events (also `push_permission_changed`) always carry `platform`
+  and `os_name`, also when the app context cannot be read.
 - **Calls before `start()`.** `setPushToken` and `setAppLanguage` called
   before `start()` are applied after the stored state is loaded. Identity
   calls made while `start()` loads the stored state wait for it.
 - Conformance: the suites run whisperr-spec `v2.json` (restoreIdentify,
   appLanguage, anonymousPush, pushRegistration, versionContext) and
   `automatic.json` `pushEventsV2`, and skip the legacy cases they supersede.
+  The v2 harness compares identify bodies and events as two ordered lists.
 
 - **Removed: the identify trait `push_permission`.** `setPushPermission()` no
   longer writes it. An app or a dashboard filter that reads this trait gets no

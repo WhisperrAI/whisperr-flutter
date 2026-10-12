@@ -1326,6 +1326,12 @@ class WhisperrClient {
     _appContext.forEach((k, v) {
       if (v != null && k != kClientAppIdKey) out[k] = v;
     });
+    // The SDK always knows the OS family, also when the app context is off.
+    final os = out['platform'] ?? osFamily();
+    if (os != null) {
+      out.putIfAbsent('platform', () => os);
+      out.putIfAbsent('os_name', () => os);
+    }
     _resolveDeviceTraits().forEach((k, v) {
       if (v != null) out[k] = v;
     });
