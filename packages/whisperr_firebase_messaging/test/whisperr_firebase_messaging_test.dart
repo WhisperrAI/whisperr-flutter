@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
@@ -18,6 +19,20 @@ class _Settings extends Fake implements NotificationSettings {
   final AuthorizationStatus authorizationStatus;
 }
 
+class _App extends Fake implements FirebaseApp {
+  _App(this.projectId);
+
+  final String projectId;
+
+  @override
+  FirebaseOptions get options => FirebaseOptions(
+        apiKey: 'key',
+        appId: '1:1:android:1',
+        messagingSenderId: '1',
+        projectId: projectId,
+      );
+}
+
 /// A FirebaseMessaging fake. Dispatches by member name, so it does not depend
 /// on the exact method signatures of one firebase_messaging version.
 class _FakeMessaging extends Fake implements FirebaseMessaging {
@@ -27,6 +42,7 @@ class _FakeMessaging extends Fake implements FirebaseMessaging {
   String? apnsToken =
       'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90';
   RemoteMessage? initialMessage;
+  String? projectId;
   final refresh = StreamController<String>.broadcast();
   final requests = <Map<Symbol, dynamic>>[];
 
@@ -47,12 +63,18 @@ class _FakeMessaging extends Fake implements FirebaseMessaging {
         return refresh.stream;
       case #getInitialMessage:
         return Future<RemoteMessage?>.value(initialMessage);
+      case #app:
+        final id = projectId;
+        if (id != null) return _App(id);
     }
     return super.noSuchMethod(invocation);
   }
 }
 
 class _Harness {
+  _Harness({this.appContext = const {}});
+
+  final Map<String, Object?> appContext;
   final identifies = <Map<String, dynamic>>[];
   final events = <Map<String, dynamic>>[];
 
@@ -75,12 +97,13 @@ class _Harness {
       persistence: InMemoryPersistence(),
       options: const WhisperrOptions(
         flushOnLifecyclePause: false,
-        trackAutomaticEvents: false,
+        // On: push_received is an automatic event.
+        trackAutomaticEvents: true,
         maxRetries: 0,
       ),
       random: Random(7),
       deviceTraits: () => const <String, Object?>{},
-      appContext: () async => const <String, Object?>{},
+      appContext: () async => appContext,
     );
     addTearDown(client.close);
     await client.start();
@@ -92,6 +115,9 @@ class _Harness {
 
   List<Map<String, dynamic>> get pushOpens =>
       events.where((e) => e['event_type'] == 'push_opened').toList();
+
+  List<Map<String, dynamic>> get receipts =>
+      events.where((e) => e['event_type'] == 'push_received').toList();
 
   /// The `status` / `previous_status` of each `push_permission_changed`.
   List<Map<String, dynamic>> get permissionReports => [
@@ -159,6 +185,88 @@ void main() {
           ],
         },
       ]);
+    });
+
+    test('sends the Firebase project id, platform and client_app_id', () async {
+      final h = _Harness(appContext: const {
+        'platform': 'android',
+        'client_app_id': 'com.example.app',
+      });
+      final client = await h.start();
+      final messaging = _FakeMessaging()..projectId = 'example-project';
+      final reg = await client.registerFirebaseMessaging(messaging);
+      messaging.refresh.add('fcm_tok_2');
+      await _pump();
+      await client.flush();
+      await reg.cancel();
+      const fields = {
+        'kind': 'fcm',
+        'platform': 'android',
+        'client_app_id': 'com.example.app',
+        'provider_project': 'example-project',
+      };
+      expect(h.identifies.first['channels'], [
+        {'channel': 'push', 'address': 'fcm_tok_1', 'opted_in': true, ...fields}
+      ]);
+      expect((h.identifies.last['channels'] as List).last, {
+        'channel': 'push',
+        'address': 'fcm_tok_2',
+        'opted_in': true,
+        ...fields
+      });
+    });
+
+    test('APNs mode never sends provider_project', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final h = _Harness();
+      final client = await h.start();
+      final messaging = _FakeMessaging()..projectId = 'example-project';
+      final reg = await client.registerFirebaseMessaging(messaging,
+          useApnsToken: true,
+          apnsEnvironment: WhisperrPushEnvironment.production);
+      await reg.cancel();
+      await client.flush();
+      final entry = (h.identifies.last['channels'] as List).single as Map;
+      expect(entry['kind'], 'apns');
+      expect(entry['push_env'], 'production');
+      expect(entry.containsKey('provider_project'), isFalse);
+      debugDefaultTargetPlatformOverride = null;
+    });
+
+    test('reports foreground Whisperr pushes as push_received, once each',
+        () async {
+      final h = _Harness();
+      final client = await h.start();
+      final foreground = StreamController<RemoteMessage>();
+      final reg = await client.registerFirebaseMessaging(_FakeMessaging(),
+          onMessage: foreground.stream);
+      foreground.add(_message('m1', {'whisperr_message_id': 'msg_1'}));
+      foreground.add(_message('m1', {'whisperr_message_id': 'msg_1'}));
+      foreground.add(_message('m2', {'campaign': 'other'}));
+      await _pump();
+      await client.flush();
+      await reg.cancel();
+      foreground.add(_message('m3', {'whisperr_message_id': 'msg_3'}));
+      await _pump();
+      await client.flush();
+      expect(h.receipts.map((e) => e['properties']['whisperr_message_id']),
+          ['msg_1']);
+      expect(h.receipts.single['properties'],
+          containsPair('source', 'foreground'));
+    });
+
+    test('trackForegroundReceipts: false reports none', () async {
+      final h = _Harness();
+      final client = await h.start();
+      final foreground = StreamController<RemoteMessage>.broadcast();
+      final reg = await client.registerFirebaseMessaging(_FakeMessaging(),
+          onMessage: foreground.stream, trackForegroundReceipts: false);
+      foreground.add(_message('m1', {'whisperr_message_id': 'msg_1'}));
+      await _pump();
+      await client.flush();
+      await reg.cancel();
+      expect(h.receipts, isEmpty);
     });
 
     test('forwards token refreshes with kind fcm', () async {
@@ -320,6 +428,11 @@ void main() {
       expect(routed, ['msg_1', 'msg_2']);
       expect(h.pushOpens.map((e) => e['properties']['whisperr_message_id']),
           ['msg_1', 'msg_2']);
+      // The launch message is a cold start; later taps are not.
+      expect(
+          h.pushOpens.map((e) => e['properties']['cold_start']), [true, false]);
+      expect(h.pushOpens.map((e) => e['properties']['action_id']),
+          ['default', 'default']);
 
       // A second subscription (hot restart) does not route the same launch
       // message again.

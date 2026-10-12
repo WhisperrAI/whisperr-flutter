@@ -33,6 +33,9 @@ WhisperrClient buildClient(
     clock: () => DateTime.utc(2026, 5, 31, 12),
     random: Random(7),
     deviceTraits: deviceTraits,
+    // Push registrations without the app context's platform (C4 is
+    // covered in push_permission_test.dart).
+    appContext: () async => const <String, Object?>{},
   );
 }
 

@@ -7,8 +7,9 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:whisperr/whisperr.dart';
 
-const _specUrl =
-    'https://raw.githubusercontent.com/WhisperrAI/whisperr-spec/main/conformance/behavior.json';
+import 'support/spec_ref.dart';
+
+const _specUrl = '$kSpecBaseUrl/behavior.json';
 
 Future<Map<String, dynamic>> _loadSpec() async {
   final local = Platform.environment['WHISPERR_BEHAVIOR_SPEC_PATH'] ??
@@ -54,6 +55,7 @@ WhisperrClient _client(
     ),
     clock: () => DateTime.utc(2026, 5, 31, 12),
     random: Random(7),
+    appContext: () async => const <String, Object?>{},
   );
 }
 

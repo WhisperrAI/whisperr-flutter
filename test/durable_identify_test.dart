@@ -48,6 +48,7 @@ WhisperrClient makeClient(WhisperrPersistence persistence,
           trackAutomaticEvents: false,
           flushInterval: const Duration(hours: 1)),
       deviceTraits: () => {},
+      appContext: () async => const <String, Object?>{},
     );
 
 Future<List<dynamic>> queue(WhisperrPersistence store) async =>

@@ -14,6 +14,7 @@ class WhisperrOptions {
     this.enablePersistence = true,
     this.flushOnLifecyclePause = true,
     this.trackAutomaticEvents = true,
+    this.restoreIdentifyDelay = const Duration(seconds: 3),
     this.debug = false,
     this.onError,
   })  : assert(flushAt > 0),
@@ -61,6 +62,17 @@ class WhisperrOptions {
   /// a persisted "last seen version", so they need [enablePersistence].
   /// Set to false to send only the events you track yourself.
   final bool trackAutomaticEvents;
+
+  /// How long [WhisperrClient.start] waits before it queues the restore
+  /// identify for a stored user. The app's own `identify()` for that user in
+  /// this window replaces it. [Duration.zero] queues it during `start()`.
+  ///
+  /// At each start with a stored user (and no opt-out), the SDK sends one
+  /// identify with the device defaults (`locale`, timezone) and the stored
+  /// app language, so the server knows the user is still signed in on this
+  /// device. It skips it when it delivered the same traits for the same user
+  /// less than 24 hours ago.
+  final Duration restoreIdentifyDelay;
 
   /// Emit verbose logs via `debugPrint`.
   final bool debug;

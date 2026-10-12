@@ -6,7 +6,7 @@ Identify your users and track product events so Whisperr can decide and deliver 
 
 ```yaml
 dependencies:
-  whisperr: ^0.5.0
+  whisperr: ^0.6.0
 ```
 
 ## Initialize
@@ -23,7 +23,7 @@ await Whisperr.initialize(apiKey: 'wpk_xxx');
 
 ## Identify
 
-Set who the current user is. Idempotent and safe to call on every login. Traits are merged server-side; channels are how Whisperr can reach the user (and whether it's allowed to).
+Set who the current user is. Call it after login or sign-up **and on session restore at app start**. It is idempotent. Traits are merged server-side; channels are how Whisperr can reach the user (and whether it's allowed to).
 
 ```dart
 // Common case — email/phone/pushToken expand into opted-in channels:
@@ -46,6 +46,36 @@ await Whisperr.instance.identify(
 ```
 
 > Whisperr decides which channel to actually use based on engagement — there's no "preferred channel" to set. Express an explicit user choice via `optedIn: false` on the channels they don't want.
+
+### Restore at start
+
+The SDK stores the user id. At each start with a stored user, it sends one
+**restore identify** (`external_user_id`, `anonymous_id`, the device traits
+and the app language; no channels), so Whisperr knows the user still uses
+the app on this device. It waits 3 seconds
+(`WhisperrOptions.restoreIdentifyDelay`): your own `identify()` for the user
+in that time replaces it. It goes through the same offline queue. It is
+skipped while opted out and when the same traits went out for the user less
+than 24 hours ago.
+
+The SDK cannot know a user who signed in before you added the SDK. Call
+`identify()` on session restore, so these users are identified on their
+first launch with the SDK.
+
+### App language
+
+```dart
+await Whisperr.instance.setAppLanguage('pt-BR'); // or Locale.toString(): 'pt_BR'
+```
+
+Set the language the user picked in your app (not the device locale), as a
+BCP 47 tag. Whisperr writes messages in this language. The SDK changes `_`
+to `-`, stores the tag, and sends it as the trait `app_language`: under the
+user, or before login under the device `anonymous_id`. Every `identify()`
+carries it; a `traits['app_language']` you pass wins. `null` clears the
+stored value. An invalid tag is ignored. `reset()` keeps it.
+
+### Device traits
 
 `identify()` also sends `traits['locale']` (BCP 47, from the platform locale) and `traits['timezone_offset_minutes']` (the device's current UTC offset — Flutter can't obtain an IANA zone name without a plugin) by default; pass your own `traits['timezone']` (an IANA name such as `Europe/Berlin`) or `traits['locale']` to override, and nothing is sent for a value the platform can't provide.
 
@@ -101,26 +131,36 @@ know:
 | Raw APNs token (iOS, sending through APNs directly) | `setPushToken(token, kind: WhisperrPushTokenKind.apns, pushEnv: WhisperrPushEnvironment.production)` |
 | OneSignal subscription id | `setPushToken(id, kind: WhisperrPushTokenKind.oneSignalSubscription)` |
 
-- With any metadata, `platform` defaults to the OS the app runs on.
+- Every token carries `platform` (the OS the app runs on) and
+  `client_app_id` (the bundle id or package name, from `package_info_plus`).
 - `pushEnv` is the APNs environment: `sandbox` for development-signed builds,
   `production` for TestFlight and the App Store. The SDK never guesses it.
-- `setPushToken(token)` without metadata sends the token only. The server then
-  infers the kind from its format.
+  It goes only with APNs tokens.
+- `providerProject` is the token's provider project: the Firebase project id
+  for an FCM token (`whisperr_firebase_messaging` sends it for you). It never
+  goes with an APNs token.
+- Without `kind`, the server infers the kind from the token format.
 
 ### Token lifecycle
 
 - Called **after login**, `setPushToken` re-identifies the push channel
   immediately.
-- Called **before login**, the token is buffered and attached to the next
-  `identify()`.
-- **Repeats are deduped across restarts**: the last-sent (user, token) pair is
-  persisted alongside the queue, so calling `getToken()` + `setPushToken` on
-  every launch never re-sends an identify for an unchanged token.
+- Called **before login**, the token goes out at once under the device
+  `anonymous_id`, so the device can get push before sign-in. The next
+  `identify()` attaches it to the user.
+- **Repeats are deduped across restarts**: the last-sent (user or anonymous
+  id, token) pair is persisted alongside the queue, so calling `getToken()` +
+  `setPushToken` on every launch never re-sends an identify for an unchanged
+  token. A token with less metadata than the one sent (a bare token after an
+  FCM token) is not sent again either.
+- **Every 7 days** the SDK sends the same token once more (at launch or on
+  the next `setPushToken`), so Whisperr knows it is still live.
 - **Token rotation** is handled: the previously sent token is opted out and the
   new one opted in, so stale tokens don't accumulate — and tokens from the
   user's other devices are never touched.
-- After `reset()` (logout), call `setPushToken` again once the next user logs
-  in.
+- **`reset()` (logout) moves the token**: it opts the token out under the old
+  user and opts it in under the new `anonymous_id`. The next user's
+  `identify()` gets it. You do not call `setPushToken` again.
 
 ### Permission
 
@@ -158,22 +198,32 @@ await Whisperr.instance
 Report push taps, so Whisperr learns which messages work:
 
 ```dart
-Future<void> onTap(RemoteMessage m) async {
-  await Whisperr.instance.trackPushOpened(m.data);
+Future<void> onTap(RemoteMessage m, {required bool coldStart}) async {
+  await Whisperr.instance.trackPushOpened(m.data, coldStart: coldStart);
   final link = WhisperrPushOpen.fromData(m.data)?.deepLink;
   if (link != null) router.go(link);
 }
 
-FirebaseMessaging.onMessageOpenedApp.listen(onTap);
+FirebaseMessaging.onMessageOpenedApp.listen((m) => onTap(m, coldStart: false));
 final initial = await FirebaseMessaging.instance.getInitialMessage();
-if (initial != null) await onTap(initial);
+if (initial != null) await onTap(initial, coldStart: true);
 ```
 
 `trackPushOpened` sends `push_opened` only for Whisperr pushes (the data has
-`whisperr_message_id`). It ignores a message id it already reported, so calling
-it from both hooks is safe. `WhisperrPushOpen.fromData` reads the message id
+`whisperr_message_id`), with `action_id` (`actionId:`, the tapped button;
+`default` for a tap on the notification) and `cold_start` when you pass
+`coldStart:` (true when the tap launched the app). It ignores a message id it
+already reported, so calling it from both hooks is safe. `WhisperrPushOpen.fromData` reads the message id
 and the deep link (`whisperr_deep_link`, else `deep_link`) without sending
 anything.
+
+### Push receipts
+
+`trackPushReceived(data)` reports a Whisperr push that arrived while the app
+is in the foreground (`FirebaseMessaging.onMessage`) as `push_received`, once
+per message id. `whisperr_firebase_messaging` calls it for you. It is an
+automatic event: `trackAutomaticEvents: false` turns it off. Background
+receipts are not reported.
 
 ## Track
 
@@ -189,6 +239,10 @@ You can call `track()` before `identify()`. The SDK sends the event under a
 device `anonymous_id`. The next `identify()` carries the same id, so Whisperr
 merges those events into the user. `reset()` starts a new anonymous id.
 
+Every event (yours and the automatic ones) carries `app_version`,
+`app_build`, `platform`, `sdk_name` and `sdk_version` in its `context`. A key
+the platform cannot provide is left out; a key you pass in `context:` wins.
+
 ## Automatic events
 
 The SDK sends these events for you. You write no code.
@@ -200,7 +254,8 @@ The SDK sends these events for you. You write no code.
 | `app_opened` | launch, and each return from background | `cold_start` |
 | `app_backgrounded` | the app leaves the screen | `foreground_ms` |
 
-Every SDK-generated event (also `screen_viewed` and `push_opened`) carries
+Every SDK-generated event (also `screen_viewed`, `push_opened` and
+`push_received`) carries
 `sdk_name` (`whisperr-flutter`), `sdk_version`, `app_version`, `app_build`,
 `platform` and `os_name` (the OS family: `ios`, `android`, `web`), `os_version`,
 `locale` and `timezone_offset_minutes`. `timezone` is sent only when it is a
@@ -262,7 +317,8 @@ await Whisperr.initialize(
     maxBatchSize: 500,     // backend hard cap
     maxQueueSize: 1000,    // drops oldest beyond this
     enablePersistence: true,
-    trackAutomaticEvents: true, // app_installed / updated / opened / backgrounded
+    trackAutomaticEvents: true, // app_installed / updated / opened / backgrounded, push_received
+    restoreIdentifyDelay: Duration(seconds: 3), // wait for your own identify() at start
     debug: false,
   ),
 );

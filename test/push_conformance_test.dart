@@ -7,8 +7,10 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:whisperr/whisperr.dart';
 
-const _specUrl =
-    'https://raw.githubusercontent.com/WhisperrAI/whisperr-spec/main/conformance/push.json';
+import 'support/spec_loader.dart';
+import 'support/spec_ref.dart';
+
+const _specUrl = '$kSpecBaseUrl/push.json';
 
 Future<Map<String, dynamic>> _loadSpec() async {
   // push.json lives next to wire.json; derive it like the behavior suite does.
@@ -43,19 +45,30 @@ WhisperrClient _client(MockClient mock, WhisperrPersistence persistence) {
       retryBaseDelay: Duration(milliseconds: 1),
       maxRetryDelay: Duration(milliseconds: 5),
       maxRetries: 2,
+      // A restart queues the restore identify at once; within one instant
+      // and with the same traits it is skipped (SPEC.md -> Clock).
+      restoreIdentifyDelay: Duration.zero,
     ),
     clock: () => DateTime.utc(2026, 5, 31, 12),
     random: Random(7),
     // Device-trait defaults are environment-dependent and never pinned by
     // the spec fixtures; device_traits_test.dart covers them.
     deviceTraits: () => const <String, Object?>{},
+    // Harnesses run with the environment keys disabled.
+    appContext: () async => const <String, Object?>{},
   );
 }
 
 void main() {
   test('push-token conformance (whisperr-spec)', () async {
     final spec = await _loadSpec();
-    final cases = (spec['cases'] as List).cast<Map<String, dynamic>>();
+    // The v2 anonymous push lane replaces the in-memory buffer on purpose;
+    // v2.json lists the legacy cases it supersedes.
+    final superseded = await supersededCases();
+    final cases = (spec['cases'] as List)
+        .cast<Map<String, dynamic>>()
+        .where((c) => !superseded.contains('push.json:${c['name']}'))
+        .toList();
     expect(cases, isNotEmpty);
     await _runCases(cases);
   });
@@ -142,6 +155,14 @@ Future<void> _runCases(List<Map<String, dynamic>> cases) async {
       await client.flush();
     }
 
-    expect(identifies, c['expectedBodies'], reason: c['name'] as String);
+    final expected =
+        (c['expectedBodies'] as List).cast<Map<String, dynamic>>();
+    expect(identifies.length, expected.length, reason: c['name'] as String);
+    for (var i = 0; i < expected.length; i++) {
+      // SPEC.md -> Contract v2 conformance: the anonymous handle rule.
+      expect(withoutUnnamedAnonymousId(identifies[i], expected[i]),
+          expected[i],
+          reason: '${c['name']} body[$i]');
+    }
   }
 }

@@ -1,6 +1,74 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+Contract v2 (whisperr-spec SPEC.md "Contract v2"). The server must accept
+contract v2 before apps ship this version: an older server rejects the
+anonymous identify and the new push token fields with `400`.
+
+- **Restore identify at start.** With a stored user and no opt-out, each
+  start queues one identify: `external_user_id`, the stored `anonymous_id`,
+  and the traits `locale`, the timezone and `app_language`. No channels. It
+  waits `WhisperrOptions.restoreIdentifyDelay` (3 seconds; `Duration.zero`
+  queues it during `start()`). The app's own `identify()` in that time
+  replaces it. It is skipped when the same traits went out for the same user
+  less than 24 hours ago, and when one is still queued (offline). It uses the
+  ordered, persisted queue.
+- **`setAppLanguage(String?)`** sets the language the user picked in the app,
+  a BCP 47 tag. `_` becomes `-` (`Locale.toString()` works). The SDK stores it
+  and sends the trait `app_language` at once: a partial identify with a user,
+  an anonymous identify (`anonymous_id` only) without one. Every `identify()`
+  and restore identify carries it; a `traits['app_language']` from the caller
+  wins. The same value again sends nothing. `null` clears the stored value and
+  sends nothing. An invalid tag is ignored. `reset()` keeps it. New getter
+  `appLanguage`.
+- **Anonymous push token.** `setPushToken` before `identify()` now sends the
+  token at once in an anonymous identify (`anonymous_id` and the push
+  channel). Before, the SDK held it in memory for the next `identify()`. The
+  dedupe pair is now (user or anonymous id, token). `identify()` attaches a
+  token registered under the anonymous id. A permission `denied` before login
+  opts the anonymous token out; `granted` opts it in under the anonymous id.
+  `optOut()` opts an anonymous token out under the anonymous id.
+- **`reset()` moves the push token.** With a registered token, `reset()` opts
+  it out under the old user, rotates the `anonymous_id`, and opts it in under
+  the new one. You no longer call `setPushToken` after logout. A full queue
+  does not fail the logout (the move is skipped, with an `onError` report).
+  A token held while `denied` stays held across `reset()`.
+- **Push token fields.** Every opted-in push entry carries `platform` (also
+  for a bare token and for `identify(pushToken:)`) and the new
+  `client_app_id` (bundle id or package name, from `package_info_plus`).
+  `setPushToken` and `attachPushTokenStream` take `providerProject` (the
+  Firebase project id for FCM), sent as the new `provider_project`.
+  `provider_project` never goes with an APNs token; `push_env` goes only with
+  APNs tokens (and with a token of unknown kind). `WhisperrChannel.push` takes
+  `clientAppId` and `providerProject`.
+- **7-day re-registration.** The stored pair keeps its send time. The SDK
+  sends the same token again once it was sent 7 days ago or more: at launch,
+  or on the next `setPushToken`. A pair stored by 0.5.x has no send time, so
+  the first launch of 0.6.0 sends the token once more, now with the new
+  fields.
+- **Metadata dedupe.** A token whose fields are all already in the sent entry
+  (for example a bare token after an FCM token) is not sent again. Before, a
+  bare token after a token with fields was deduped only when it had no fields
+  at all.
+- **`push_opened`** carries `action_id` (`actionId:`; `default` for a tap on
+  the notification) and `cold_start` when the caller passes `coldStart:`.
+- **`trackPushReceived(data)`** sends the new automatic event
+  `push_received` (`whisperr_message_id`, `foreground: true`,
+  `source: foreground`) once per message id (the last 50 are remembered
+  across restarts). Only for Whisperr pushes. `trackAutomaticEvents: false`
+  turns it off.
+- **Versions in every event context.** Every event (custom and automatic)
+  carries `app_version`, `app_build`, `platform`, `sdk_name` and
+  `sdk_version` in `context`. No value, no key. A key the caller passes in
+  `context` wins. The SDK never puts `locale` in context. `client_app_id` is
+  never an event property.
+- **Calls before `start()`.** `setPushToken` and `setAppLanguage` called
+  before `start()` are applied after the stored state is loaded. Identity
+  calls made while `start()` loads the stored state wait for it.
+- Conformance: the suites run whisperr-spec `v2.json` (restoreIdentify,
+  appLanguage, anonymousPush, pushRegistration, versionContext) and
+  `automatic.json` `pushEventsV2`, and skip the legacy cases they supersede.
 
 - **Removed: the identify trait `push_permission`.** `setPushPermission()` no
   longer writes it. An app or a dashboard filter that reads this trait gets no

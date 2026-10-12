@@ -19,9 +19,11 @@ dependencies:
   flutter:
     sdk: flutter
   firebase_messaging: ">=15.1.0 <17.0.0"
-  whisperr: ^0.5.0
+  whisperr: ^0.6.0
 
 dev_dependencies:
+  # FirebaseApp / FirebaseOptions fakes in the tests.
+  firebase_core: ">=3.6.0 <5.0.0"
   flutter_test:
     sdk: flutter
   flutter_lints: ^4.0.0

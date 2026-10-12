@@ -47,3 +47,13 @@ PlatformDispatcher _dispatcher() {
     return PlatformDispatcher.instance;
   }
 }
+
+final _languageTag = RegExp(r'^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$');
+
+/// Normalizes an app language tag to BCP 47 form: trims it and changes `_`
+/// to `-` (Flutter's `Locale.toString()` gives `pt_BR`). Returns null when
+/// the result is not a well-formed tag (`de`, `pt-BR`, `zh-Hant-TW`).
+String? normalizeLanguageTag(String tag) {
+  final normalized = tag.trim().replaceAll('_', '-');
+  return _languageTag.hasMatch(normalized) ? normalized : null;
+}

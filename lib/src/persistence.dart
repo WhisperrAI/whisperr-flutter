@@ -5,7 +5,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 ///
 /// State lives in named slots ([queueSlot], [identitySlot], [pushSlot],
 /// [anonymousSlot], [appSlot], [optOutSlot], [pushOpenedSlot],
-/// [pushPermissionSlot]), each
+/// [pushPermissionSlot], [appLanguageSlot], [identifySentSlot],
+/// [pushReceivedSlot]), each
 /// holding a single string blob. Implementations decide how slots map to
 /// underlying storage keys.
 abstract class WhisperrPersistence {
@@ -16,9 +17,11 @@ abstract class WhisperrPersistence {
   /// attribution (and push-token dedupe) without re-identifying.
   static const String identitySlot = 'identity';
 
-  /// The last-sent (user, push token) pair. Persisted so every-launch
-  /// `getToken()` wiring stays a no-op across restarts and a post-restart
-  /// rotation can still opt the stale token out.
+  /// The last-sent (subject, push token) pair, with the token metadata and
+  /// the send time. The subject is the user id, or the anonymous id for a
+  /// token sent before identify. Persisted so every-launch `getToken()`
+  /// wiring stays a no-op across restarts, a post-restart rotation can still
+  /// opt the stale token out, and the token is sent again after 7 days.
   static const String pushSlot = 'push';
 
   /// The device's anonymous handle (`anonymous_id`) for events sent before
@@ -39,6 +42,18 @@ abstract class WhisperrPersistence {
   /// `setPushPermission`, and the status last sent as
   /// `push_permission_changed`.
   static const String pushPermissionSlot = 'push_permission';
+
+  /// The language the user picked in the app (`setAppLanguage`), a BCP 47
+  /// tag.
+  static const String appLanguageSlot = 'app_language';
+
+  /// The last delivered identify that carried the restore traits: the user,
+  /// the traits fingerprint and the time. Lets a launch skip a redundant
+  /// restore identify for 24 hours.
+  static const String identifySentSlot = 'identify_sent';
+
+  /// Recent `whisperr_message_id`s already reported as `push_received`.
+  static const String pushReceivedSlot = 'push_received';
 
   Future<String?> load(String slot);
   Future<void> save(String slot, String data);

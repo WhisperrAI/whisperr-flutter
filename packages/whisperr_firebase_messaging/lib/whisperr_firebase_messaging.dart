@@ -9,6 +9,9 @@
 ///   onOpen: (open, message) => router.go(open.deepLink ?? '/'),
 /// );
 /// ```
+///
+/// `registerFirebaseMessaging` also reports Whisperr pushes that arrive while
+/// the app is in the foreground (`push_received`).
 library whisperr_firebase_messaging;
 
 import 'dart:async';
@@ -39,7 +42,7 @@ WhisperrPushPermission whisperrPermissionFrom(AuthorizationStatus status) {
 /// it while the app runs; [cancel] stops the token and permission updates.
 class WhisperrFirebaseRegistration {
   WhisperrFirebaseRegistration._(this.permission, this.token, this.error,
-      this._tokenSubscription, this._lifecycle);
+      this._tokenSubscription, this._lifecycle, this._receipts);
 
   /// The notification permission, as reported to Whisperr.
   final WhisperrPushPermission permission;
@@ -53,12 +56,14 @@ class WhisperrFirebaseRegistration {
 
   final StreamSubscription<String>? _tokenSubscription;
   final AppLifecycleListener? _lifecycle;
+  final StreamSubscription<RemoteMessage>? _receipts;
 
-  /// Stops forwarding token refreshes and re-checking the permission on
-  /// resume.
+  /// Stops forwarding token refreshes, re-checking the permission on resume,
+  /// and reporting foreground receipts.
   Future<void> cancel() async {
     _lifecycle?.dispose();
     await _tokenSubscription?.cancel();
+    await _receipts?.cancel();
   }
 }
 
@@ -69,9 +74,12 @@ final Set<String> _routed = <String>{};
 /// Firebase Cloud Messaging helpers on the Whisperr client.
 extension WhisperrFirebaseMessaging on WhisperrClient {
   /// Asks for notification permission, reports it, and registers the FCM
-  /// token (with `kind: fcm`). It keeps both current: token refreshes are
+  /// token (with `kind: fcm` and the Firebase project id as
+  /// `provider_project`). It keeps both current: token refreshes are
   /// forwarded, and the permission is checked again each time the app
-  /// resumes (users change it in Settings). Never throws.
+  /// resumes (users change it in Settings). It also reports each Whisperr
+  /// push that arrives while the app is in the foreground
+  /// (`FirebaseMessaging.onMessage`) as `push_received`. Never throws.
   ///
   /// - [requestPermission]: show the OS prompt. Set false to only read the
   ///   current permission (for example when you ask at a later step).
@@ -80,8 +88,18 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
   ///   instead of the FCM token. Use it only when Whisperr sends to your
   ///   app through APNs directly. Set [apnsEnvironment] then: `sandbox` for
   ///   development-signed builds, `production` for TestFlight and the App
-  ///   Store. It is never guessed.
+  ///   Store. This package has no native code, so it cannot read the
+  ///   `aps-environment` entitlement: pass it, for example
+  ///   `kReleaseMode ? production : sandbox` when your release builds are
+  ///   App Store or TestFlight builds. It is never guessed; without it the
+  ///   token goes without `push_env` (and a debug log says so).
   /// - [watchPermission]: re-check the permission on resume. Default true.
+  /// - [trackForegroundReceipts]: report foreground Whisperr pushes as
+  ///   `push_received`. Default true. Background receipts are not reported:
+  ///   `FirebaseMessaging.onBackgroundMessage` runs in a separate isolate
+  ///   without the Whisperr client.
+  /// - [onMessage]: the foreground message stream. Defaults to
+  ///   `FirebaseMessaging.onMessage`.
   ///
   /// Call it after `Whisperr.initialize()`. Calling it again is safe.
   Future<WhisperrFirebaseRegistration> registerFirebaseMessaging(
@@ -91,8 +109,25 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
     bool useApnsToken = false,
     WhisperrPushEnvironment? apnsEnvironment,
     bool watchPermission = true,
+    bool trackForegroundReceipts = true,
+    Stream<RemoteMessage>? onMessage,
   }) async {
     final apns = useApnsToken && _isIOS;
+    if (apns && apnsEnvironment == null) {
+      debugPrint('[whisperr] useApnsToken without apnsEnvironment: the APNs '
+          'token goes without push_env. Pass apnsEnvironment.');
+    }
+    StreamSubscription<RemoteMessage>? receipts;
+    if (trackForegroundReceipts) {
+      try {
+        receipts = (onMessage ?? FirebaseMessaging.onMessage).listen(
+            (m) => unawaited(handleForegroundMessage(m)),
+            onError: (Object _) {});
+      } catch (_) {
+        // No messaging platform: no receipts.
+      }
+    }
+    final project = apns ? null : _firebaseProjectId(messaging);
     var permission = WhisperrPushPermission.undetermined;
     try {
       final settings = requestPermission
@@ -101,7 +136,8 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
       permission = whisperrPermissionFrom(settings.authorizationStatus);
       await setPushPermission(permission);
     } catch (e) {
-      return WhisperrFirebaseRegistration._(permission, null, e, null, null);
+      return WhisperrFirebaseRegistration._(
+          permission, null, e, null, null, receipts);
     }
 
     var current = permission;
@@ -109,7 +145,7 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
     Object? error;
     Future<void> fetchToken() async {
       try {
-        token = await _registerToken(messaging, apns, apnsEnvironment);
+        token = await _registerToken(messaging, apns, apnsEnvironment, project);
         error = null;
       } catch (e) {
         error = e;
@@ -124,7 +160,8 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
         : messaging.onTokenRefresh.listen(
             (t) {
               if (!current.allowsPush) return;
-              unawaited(setPushToken(t, kind: WhisperrPushTokenKind.fcm)
+              unawaited(setPushToken(t,
+                      kind: WhisperrPushTokenKind.fcm, providerProject: project)
                   .catchError((Object _) {}));
             },
             onError: (Object _) {},
@@ -152,20 +189,38 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
       }
     }
     return WhisperrFirebaseRegistration._(
-        permission, token, error, tokenSubscription, lifecycle);
+        permission, token, error, tokenSubscription, lifecycle, receipts);
+  }
+
+  /// Reports [message] as `push_received` (foreground, once per Whisperr
+  /// message id) and returns true. Returns false for a push that did not
+  /// come from Whisperr, a message already reported, or when automatic
+  /// events are off. Never throws.
+  ///
+  /// [registerFirebaseMessaging] calls it for `FirebaseMessaging.onMessage`;
+  /// call it yourself only with `trackForegroundReceipts: false`.
+  Future<bool> handleForegroundMessage(RemoteMessage message) async {
+    try {
+      return await trackPushReceived(message.data);
+    } catch (_) {
+      return false;
+    }
   }
 
   /// Records a tap on [message] (`push_opened`, once per message) and returns
   /// the message id and deep link for your router. Returns null for a push
   /// that did not come from Whisperr. Never throws.
   ///
-  /// Call it from `FirebaseMessaging.onMessageOpenedApp` and with
-  /// `getInitialMessage()` — or use [handleNotificationOpens], which does both.
-  Future<WhisperrPushOpen?> handleRemoteMessage(RemoteMessage message) async {
+  /// Call it from `FirebaseMessaging.onMessageOpenedApp` (`coldStart: false`)
+  /// and with `getInitialMessage()` (`coldStart: true`) — or use
+  /// [handleNotificationOpens], which does both. The open goes with
+  /// `action_id: default` (FCM reports taps on the notification only).
+  Future<WhisperrPushOpen?> handleRemoteMessage(RemoteMessage message,
+      {bool? coldStart}) async {
     final open = WhisperrPushOpen.fromData(message.data);
     if (open == null) return null;
     try {
-      await trackPushOpened(message.data);
+      await trackPushOpened(message.data, coldStart: coldStart);
     } catch (_) {
       // Routing must not depend on analytics.
     }
@@ -184,10 +239,11 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
     required void Function(WhisperrPushOpen open, RemoteMessage message) onOpen,
     Stream<RemoteMessage>? onMessageOpenedApp,
   }) async {
-    Future<void> handle(RemoteMessage message) async {
+    Future<void> handle(RemoteMessage message,
+        {required bool coldStart}) async {
       final id = message.messageId;
       if (id != null && !_routed.add(id)) return;
-      final open = await handleRemoteMessage(message);
+      final open = await handleRemoteMessage(message, coldStart: coldStart);
       if (open == null) return;
       try {
         onOpen(open, message);
@@ -197,11 +253,12 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
     }
 
     final subscription =
-        (onMessageOpenedApp ?? FirebaseMessaging.onMessageOpenedApp)
-            .listen((m) => unawaited(handle(m)), onError: (Object _) {});
+        (onMessageOpenedApp ?? FirebaseMessaging.onMessageOpenedApp).listen(
+            (m) => unawaited(handle(m, coldStart: false)),
+            onError: (Object _) {});
     try {
       final initial = await messaging.getInitialMessage();
-      if (initial != null) await handle(initial);
+      if (initial != null) await handle(initial, coldStart: true);
     } catch (_) {
       // No initial message available.
     }
@@ -210,7 +267,7 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
 
   /// Gets the token and hands it to Whisperr. Returns it, or null.
   Future<String?> _registerToken(FirebaseMessaging messaging, bool apns,
-      WhisperrPushEnvironment? apnsEnvironment) async {
+      WhisperrPushEnvironment? apnsEnvironment, String? project) async {
     if (apns) {
       final token = await _apnsToken(messaging);
       if (token == null) throw StateError('no APNs token yet');
@@ -224,7 +281,8 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
     if (_isIOS) await _apnsToken(messaging);
     final token = await messaging.getToken();
     if (token == null || token.isEmpty) return null;
-    await setPushToken(token, kind: WhisperrPushTokenKind.fcm);
+    await setPushToken(token,
+        kind: WhisperrPushTokenKind.fcm, providerProject: project);
     return token;
   }
 
@@ -241,6 +299,17 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
 }
 
 bool get _isIOS => !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+
+/// The Firebase project id of [messaging]'s app (`provider_project`), or
+/// null when Firebase cannot say.
+String? _firebaseProjectId(FirebaseMessaging messaging) {
+  try {
+    final id = messaging.app.options.projectId.trim();
+    return id.isEmpty ? null : id;
+  } catch (_) {
+    return null;
+  }
+}
 
 /// Test hook: forget the messages already routed.
 @visibleForTesting
