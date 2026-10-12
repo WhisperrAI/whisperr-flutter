@@ -9,6 +9,10 @@ import 'os_version_stub.dart' if (dart.library.io) 'os_version_io.dart';
 /// The value of the `sdk_name` property on SDK-generated events.
 const String kWhisperrSdkName = 'whisperr-flutter';
 
+/// The app context key for the bundle id / package name. Used on push token
+/// registrations (`client_app_id`), never as an event property.
+const String kClientAppIdKey = 'client_app_id';
+
 /// Static app and OS context attached to every SDK-generated event
 /// (`app_installed`, `app_updated`, `app_opened`, `app_backgrounded`,
 /// `screen_viewed`, `push_opened`).
@@ -19,6 +23,10 @@ const String kWhisperrSdkName = 'whisperr-flutter';
 /// - `os_version` — the OS release (`17.4`) where Dart can read it without a
 ///   plugin: iOS, macOS and Windows. Android and Linux report only a kernel
 ///   version, so the key is omitted there.
+///
+/// - `client_app_id` — the iOS bundle id or the Android package name
+///   (`package_info_plus`). It goes on push token registrations only, never
+///   on events.
 ///
 /// The client adds `sdk_name` / `sdk_version`.
 ///
@@ -41,6 +49,9 @@ Future<Map<String, Object?>> defaultAppContext() async {
     }
     if (info.buildNumber.trim().isNotEmpty) {
       out['app_build'] = info.buildNumber.trim();
+    }
+    if (info.packageName.trim().isNotEmpty) {
+      out[kClientAppIdKey] = info.packageName.trim();
     }
   } catch (_) {
     // No plugin / no binding (pure-Dart test, background isolate): omit.

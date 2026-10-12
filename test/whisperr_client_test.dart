@@ -35,6 +35,8 @@ WhisperrClient buildClient(
     // Device-trait defaults are environment-dependent and never pinned by
     // the spec fixtures; device_traits_test.dart covers them.
     deviceTraits: () => const <String, Object?>{},
+    // Harnesses run with the environment keys disabled.
+    appContext: () async => const <String, Object?>{},
   );
 }
 
@@ -284,7 +286,9 @@ void main() {
     expect(client.pendingCount, 0);
   });
 
-  test('reset clears the persisted push pair so the token re-sends', () async {
+  test(
+      'reset moves the token to the new anonymous handle; identify attaches it',
+      () async {
     final store = InMemoryPersistence();
     final identifies = <Map<String, dynamic>>[];
     final mock = MockClient((req) async {
@@ -299,24 +303,49 @@ void main() {
     await c1.start();
     await c1.identify('u1');
     await c1.setPushToken('tok_a');
-    await c1.reset(); // logout: clears identity + persisted push pair
+    await c1.reset(); // logout: the token moves to a new anonymous handle
+    final anon = c1.anonymousId;
     await c1.close();
+    expect(anon, isNotNull);
 
     final c2 = buildClient(mock, persistence: store);
     addTearDown(c2.close);
     await c2.start();
     expect(c2.currentUserId, isNull); // reset cleared the persisted identity
+    expect(c2.anonymousId, anon);
 
-    await c2.identify('u1');
-    await c2.setPushToken('tok_a'); // must send again — pair was cleared
+    await c2.identify('u2'); // attaches the token the device holds
+    await c2.setPushToken('tok_a'); // already sent for u2: no-op
     await c2.flush();
 
-    final pushBodies =
-        identifies.where((b) => b.containsKey('channels')).toList();
-    expect(pushBodies, hasLength(2));
-    // No opt-out entry: the previous pair was forgotten on reset.
-    expect(pushBodies.last['channels'],
-        [{'channel': 'push', 'address': 'tok_a', 'opted_in': true}]);
+    expect(identifies, [
+      {'external_user_id': 'u1'},
+      {
+        'external_user_id': 'u1',
+        'channels': [
+          {'channel': 'push', 'address': 'tok_a', 'opted_in': true}
+        ],
+      },
+      {
+        'external_user_id': 'u1',
+        'channels': [
+          {'channel': 'push', 'address': 'tok_a', 'opted_in': false}
+        ],
+      },
+      {
+        'anonymous_id': anon,
+        'channels': [
+          {'channel': 'push', 'address': 'tok_a', 'opted_in': true}
+        ],
+      },
+      {
+        'external_user_id': 'u2',
+        'anonymous_id': anon,
+        'channels': [
+          {'channel': 'push', 'address': 'tok_a', 'opted_in': true}
+        ],
+      },
+    ]);
   });
 
   test(

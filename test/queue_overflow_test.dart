@@ -7,7 +7,8 @@ import 'package:http/testing.dart';
 import 'package:whisperr/whisperr.dart';
 
 WhisperrClient overflowClient(
-    MockClient transport, WhisperrPersistence persistence) {
+    MockClient transport, WhisperrPersistence persistence,
+    {int capacity = 3}) {
   return WhisperrClient(
     apiClient: WhisperrApiClient(
       httpClient: transport,
@@ -16,15 +17,16 @@ WhisperrClient overflowClient(
       sdkVersion: 'test',
     ),
     persistence: persistence,
-    options: const WhisperrOptions(
-      flushInterval: Duration(hours: 1),
+    options: WhisperrOptions(
+      flushInterval: const Duration(hours: 1),
       flushAt: 3,
       maxBatchSize: 3,
-      maxQueueSize: 3,
+      maxQueueSize: capacity,
       flushOnLifecyclePause: false,
       trackAutomaticEvents: false,
     ),
     deviceTraits: () => {},
+    appContext: () async => const <String, Object?>{},
   );
 }
 
@@ -56,7 +58,8 @@ void main() {
           events.addAll(batch);
           return http.Response(
               jsonEncode({'accepted': batch.length, 'rejected': 0}), 202);
-        }), store);
+          // Room for the two identifies reset() adds to move the token.
+        }), store, capacity: 5);
         addTearDown(() async {
           if (!response.isCompleted) {
             response.complete(http.Response('{}', 400));
@@ -69,12 +72,14 @@ void main() {
         for (var i = 1; i <= 3; i++) {
           await client.track('old_event_$i', userId: 'old-user');
         }
-        expect(client.pendingCount, 3);
+        expect(client.pendingCount, 4);
 
+        // reset() queues the token's opt-out under old-user and its opt-in
+        // under the new anonymous handle; capacity evicts old events.
         await client.reset(flushBeforeReset: false);
         await client.identify(nextUser, pushToken: nextToken);
         final queued = await persistedQueue(store);
-        expect(queued, hasLength(3));
+        expect(queued, hasLength(5));
         final expectedEvents = queued
             .map((op) => op['body'])
             .where((body) => body['event_type'] != null)
@@ -87,7 +92,8 @@ void main() {
         expect(events, expectedEvents,
             reason: 'Only capacity-evicted operations may be lost.');
         expect(identifies.map((body) => body['external_user_id']),
-            ['old-user', nextUser]);
+            ['old-user', 'old-user', null, nextUser]);
+        expect(identifies[2]['anonymous_id'], isNotNull);
         expect(client.currentUserId, nextUser);
         expect(client.pendingCount, 0);
         expect(await persistedQueue(store), isEmpty);
@@ -96,9 +102,12 @@ void main() {
         // even when the same account logs in again with the same token.
         await client.setPushToken(nextToken);
         await client.flush();
-        expect(identifies, hasLength(2));
-        expect(jsonDecode((await store.load(WhisperrPersistence.pushSlot))!),
-            {'user_id': nextUser, 'token': nextToken});
+        expect(identifies, hasLength(4));
+        final pair =
+            jsonDecode((await store.load(WhisperrPersistence.pushSlot))!)
+                as Map<String, dynamic>;
+        expect(pair['user_id'], nextUser);
+        expect(pair['token'], nextToken);
       });
     }
   }

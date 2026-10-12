@@ -16,6 +16,8 @@ const _common = <String, Object?>{
   'sdk_name': 'whisperr-flutter',
   'sdk_version': kWhisperrSdkVersion,
   'platform': 'ios',
+  // The SDK fills os_name from the platform when the app context has none.
+  'os_name': 'ios',
 };
 
 /// Storage whose reads finish a timer tick later, like a first disk read.
@@ -138,8 +140,8 @@ void main() {
             'address': 'fcm_tok',
             'opted_in': true,
             'kind': 'fcm',
-            // flutter_test runs as Android unless a test overrides it.
-            'platform': 'android',
+            // The platform from the app context (the device's OS family).
+            'platform': 'ios',
           }
         ],
       });
@@ -177,7 +179,8 @@ void main() {
       ]);
     });
 
-    test('a bare token stays bare; unknown platforms are dropped', () async {
+    test('a bare token gets the device platform; an unknown one falls back',
+        () async {
       final h = _Harness();
       final c = await h.start();
       await c.identify('user_1');
@@ -188,7 +191,7 @@ void main() {
           'channel': 'push',
           'address': 'tok_a',
           'opted_in': true,
-          'platform': 'android',
+          'platform': 'ios',
         }
       ]);
     });
@@ -205,7 +208,12 @@ void main() {
       await c.flush();
       expect(h.identifies.skip(1).map((b) => b['channels']).toList(), [
         [
-          {'channel': 'push', 'address': 'fcm_tok', 'opted_in': true}
+          {
+            'channel': 'push',
+            'address': 'fcm_tok',
+            'opted_in': true,
+            'platform': 'ios',
+          }
         ],
         [
           {
@@ -213,7 +221,7 @@ void main() {
             'address': 'fcm_tok',
             'opted_in': true,
             'kind': 'fcm',
-            'platform': 'android',
+            'platform': 'ios',
           }
         ],
       ]);
@@ -342,7 +350,7 @@ void main() {
               'address': 'fcm_tok',
               'opted_in': true,
               'kind': 'fcm',
-              'platform': 'android',
+              'platform': 'ios',
             }
           ],
         }

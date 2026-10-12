@@ -7,8 +7,9 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:whisperr/whisperr.dart';
 
-const _specUrl =
-    'https://raw.githubusercontent.com/WhisperrAI/whisperr-spec/main/conformance/anonymous.json';
+import 'support/spec_ref.dart';
+
+const _specUrl = '$kSpecBaseUrl/anonymous.json';
 
 Future<Map<String, dynamic>> _loadSpec() async {
   // anonymous.json lives next to wire.json; derive it like the push suite.
@@ -48,6 +49,8 @@ WhisperrClient _client(MockClient mock) {
     random: Random(7),
     // Harnesses run with device trait defaults disabled (anonymous.json).
     deviceTraits: () => const <String, Object?>{},
+    // Harnesses run with the environment keys disabled.
+    appContext: () async => const <String, Object?>{},
   );
 }
 

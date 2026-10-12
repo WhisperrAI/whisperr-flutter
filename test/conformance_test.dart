@@ -7,8 +7,9 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:whisperr/whisperr.dart';
 
-const _specUrl =
-    'https://raw.githubusercontent.com/WhisperrAI/whisperr-spec/main/conformance/wire.json';
+import 'support/spec_ref.dart';
+
+const _specUrl = '$kSpecBaseUrl/wire.json';
 final _rfc3339Z = RegExp(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$');
 
 Future<Map<String, dynamic>> _loadSpec() async {
@@ -45,6 +46,8 @@ WhisperrClient _client(MockClient mock, {DateTime? clock}) {
     // Device-trait defaults are environment-dependent and never pinned by
     // the spec fixtures; device_traits_test.dart covers them.
     deviceTraits: () => const <String, Object?>{},
+    // Harnesses run with the environment keys disabled.
+    appContext: () async => const <String, Object?>{},
   );
 }
 

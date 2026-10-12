@@ -9,8 +9,10 @@ import 'package:http/testing.dart';
 import 'package:whisperr/src/app_context.dart' show kWhisperrSdkName, osFamily;
 import 'package:whisperr/whisperr.dart';
 
-const _specUrl =
-    'https://raw.githubusercontent.com/WhisperrAI/whisperr-spec/main/conformance/automatic.json';
+import 'support/spec_loader.dart';
+import 'support/spec_ref.dart';
+
+const _specUrl = '$kSpecBaseUrl/automatic.json';
 
 Future<Map<String, dynamic>> _loadSpec() async {
   // automatic.json lives next to wire.json; derive it like the push suite.
@@ -108,7 +110,9 @@ class _Case {
   }
 
   /// Every event sent, in send order, without identity, time and context.
-  List<Map<String, dynamic>> sentEvents() {
+  /// [contexts] receives each event's context.
+  List<Map<String, dynamic>> sentEvents(
+      [List<Map<dynamic, dynamic>>? contexts]) {
     final out = <Map<String, dynamic>>[];
     for (final r in requests) {
       final path = r.url.path;
@@ -120,6 +124,7 @@ class _Case {
       for (final e in events) {
         expect((e['context'] as Map)[r'$message_id'], isNotNull,
             reason: '$name: context.\$message_id');
+        contexts?.add(e['context'] as Map);
         out.add({'event_type': e['event_type'], 'properties': e['properties']});
       }
     }
@@ -178,6 +183,18 @@ Future<void> _run(_Case c) async {
         await live().screen(value as String);
       case 'pushOpened':
         await live().trackPushOpened(Map<String, dynamic>.from(value as Map));
+      case 'receivePush':
+        // Flutter's only receipt path is the in-app foreground handler.
+        final push = Map<String, dynamic>.from(value as Map);
+        await live()
+            .trackPushReceived(Map<String, dynamic>.from(push['data'] as Map));
+      case 'openPush':
+        final push = Map<String, dynamic>.from(value as Map);
+        await live().trackPushOpened(
+          Map<String, dynamic>.from(push['data'] as Map),
+          actionId: push['actionId'] as String?,
+          coldStart: push['launchedApp'] as bool?,
+        );
       case 'pushPermission':
         final status = WhisperrPushPermission.fromWire(value);
         if (status == null) fail('${c.name}: unknown status $value');
@@ -197,7 +214,57 @@ Future<void> _run(_Case c) async {
   await client?.close();
 }
 
+/// The context keys a v2 expectation governs (SPEC.md -> Version context).
+const _governed = [
+  'app_version',
+  'app_build',
+  'platform',
+  'sdk_name',
+  'sdk_version',
+  'locale',
+];
+
+/// Whether this SDK has the receipt path a `receivePush` step names.
+bool _hasReceiptPath(Map<String, dynamic> c) =>
+    (c['steps'] as List).every((s) =>
+        (s as Map)['receivePush'] == null ||
+        s['receivePush']['source'] == 'foreground');
+
 void main() {
+  test('automatic-events conformance, contract v2 push events (pushEventsV2)',
+      () async {
+    final spec = await _loadSpec();
+    final cases = ((spec['pushEventsV2'] as Map?)?['cases'] as List? ?? [])
+        .cast<Map<String, dynamic>>()
+        .where(_hasReceiptPath)
+        .toList();
+    expect(cases, isNotEmpty);
+    for (final raw in cases) {
+      final c = _Case(raw);
+      await _run(c);
+      final contexts = <Map<dynamic, dynamic>>[];
+      final sent = c.sentEvents(contexts);
+      final expected = raw['expectedEvents'] as List;
+      expect(sent.length, expected.length, reason: c.name);
+      for (var i = 0; i < expected.length; i++) {
+        final e = expected[i] as Map;
+        expect(
+            sent[i],
+            {
+              'event_type': e['event_type'],
+              'properties': _bind(e['properties']),
+            },
+            reason: '${c.name} event[$i]');
+        final want = e['context'] as Map?;
+        if (want == null) continue;
+        for (final key in _governed) {
+          expect(contexts[i][key], _bind(want[key]),
+              reason: '${c.name} event[$i] context.$key');
+        }
+      }
+    }
+  });
+
   test('automatic-events conformance (whisperr-spec)', () async {
     final spec = await _loadSpec();
     final common = Map<String, dynamic>.from(spec['commonProperties'] as Map);
@@ -207,7 +274,11 @@ void main() {
           reason: 'commonProperties.$key');
     }
 
-    final cases = (spec['cases'] as List).cast<Map<String, dynamic>>();
+    final superseded = await supersededCases();
+    final cases = (spec['cases'] as List)
+        .cast<Map<String, dynamic>>()
+        .where((c) => !superseded.contains('automatic.json:${c['name']}'))
+        .toList();
     expect(cases, isNotEmpty);
     for (final raw in cases) {
       final c = _Case(raw);

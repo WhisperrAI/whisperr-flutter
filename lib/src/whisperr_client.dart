@@ -13,7 +13,7 @@ import 'persistence.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.5.0';
+const String kWhisperrSdkVersion = '0.6.0';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
@@ -30,6 +30,14 @@ const _pushPlatforms = {'ios', 'android', 'web', 'macos', 'windows', 'linux'};
 /// How many reported `whisperr_message_id`s [WhisperrClient.trackPushOpened]
 /// remembers for dedupe.
 const int _maxRememberedPushOpens = 50;
+
+/// The SDK sends the same push token again after this time (at launch or on
+/// the next setPushToken), so the server sees the token is still live.
+const Duration _pushReRegisterAfter = Duration(days: 7);
+
+/// A restore identify is skipped when the same traits for the same user were
+/// delivered less than this time ago.
+const Duration _restoreIdentifyThrottle = Duration(hours: 24);
 
 /// The Whisperr engine: an ordered, durable outbound queue that delivers
 /// identify and track calls to the runtime API with batching, retry, and
@@ -61,13 +69,16 @@ class WhisperrClient {
   final WhisperrOptions _options;
   final DateTime Function() _clock;
   final Random _random;
+
   /// Source for the anonymous handle: a secure generator unless a test pins
   /// [random].
   final Random _idRandom;
+
   /// Resolves the reserved identify trait defaults (see [defaultDeviceTraits]);
   /// injectable so tests can pin or silence them. Also supplies `locale` and
   /// the timezone on SDK-generated events.
   final Map<String, Object?> Function() _deviceTraits;
+
   /// Resolves the static app/OS context for SDK-generated events (see
   /// [defaultAppContext]); injectable so tests can pin it.
   final Future<Map<String, Object?>> Function() _appContextResolver;
@@ -77,19 +88,49 @@ class WhisperrClient {
   Future<void> _queueTail = Future.value();
   Future<void> _identityTail = Future.value();
   String? _currentUserId;
-  /// Token captured before identify() (attached to the next identify), or
-  /// held back while the reported permission is denied (sent when it comes
-  /// back). An opted-in push channel with its metadata. Memory-only by
-  /// design: FCM/APNs re-deliver the token on every launch.
+
+  /// A token held back while the reported permission is denied (sent when it
+  /// comes back), or set before [start] (sent by start()). An opted-in push
+  /// channel with its metadata. Memory-only by design: FCM/APNs re-deliver
+  /// the token on every launch.
   WhisperrChannel? _pendingPushToken;
-  /// Last push token delivered and for which user — dedups refresh storms and
-  /// lets a rotation opt the previous token out. Persisted (and restored on
-  /// start) so the dedupe survives app restarts.
+
+  /// Last push token delivered and for which subject — dedups refresh storms
+  /// and lets a rotation opt the previous token out. The subject is the user
+  /// ([_lastPushUserId]) or, for a token sent before identify, the anonymous
+  /// handle ([_lastPushAnonymousId]); at most one of them is set. Persisted
+  /// (and restored on start) so the dedupe survives app restarts.
   String? _lastPushToken;
   String? _lastPushUserId;
+  String? _lastPushAnonymousId;
+
   /// The token metadata last delivered with [_lastPushToken] (see
   /// [_pushMeta]), so a token re-sent with new metadata is not deduped away.
   String? _lastPushMeta;
+
+  /// When the pair was sent. The same token goes out again after
+  /// [_pushReRegisterAfter]. Null for a pair stored by an older SDK.
+  DateTime? _lastPushSentAt;
+
+  /// The language the user picked in the app ([setAppLanguage]). Persisted.
+  String? _appLanguage;
+
+  /// The last delivered identify that carried the restore traits. Persisted.
+  ({String user, Map<String, dynamic> traits, DateTime at})? _identifySent;
+
+  /// A [setAppLanguage] call made before [start]; applied after the restore.
+  ({String? tag})? _languageBeforeStart;
+
+  /// The pending restore identify (see [WhisperrOptions.restoreIdentifyDelay]).
+  Timer? _restoreTimer;
+
+  /// Set when the app calls [identify] in this process: the restore identify
+  /// is then not needed.
+  bool _identifyCalled = false;
+
+  /// Recent `whisperr_message_id`s already sent as `push_received`.
+  final List<String> _pushReceived = [];
+
   /// The device's notification permission: the status last reported through
   /// [setPushPermission] and the one last sent as `push_permission_changed`.
   /// Persisted.
@@ -97,21 +138,26 @@ class WhisperrClient {
   Timer? _timer;
   Future<void>? _flushing;
   AppLifecycleListener? _lifecycle;
+
   /// Push-token stream subscriptions opened by [attachPushTokenStream];
   /// cancelled on [close] so late token emissions can't reach a dead client.
   final List<StreamSubscription<String>> _pushSubscriptions = [];
+
   /// The device's anonymous handle. Created on the first event sent before
   /// identify(), persisted, carried on identify() (which promotes it), and
   /// rotated by reset().
   String? _anonymousId;
   bool _optedOut = false;
+
   /// Recent `whisperr_message_id`s already sent as `push_opened`.
   final List<String> _pushOpened = [];
+
   /// Lifecycle bookkeeping for `app_opened` / `app_backgrounded`.
   bool _inBackground = false;
   bool _coldOpenPending = false;
   DateTime? _foregroundSince;
   bool _started = false;
+
   /// Set by [start]; [optOut] waits for it so it sees the restored pair.
   Future<bool>? _restoring;
   bool _closed = false;
@@ -128,6 +174,9 @@ class WhisperrClient {
   /// Whether [optOut] stopped all sending. Persisted across restarts.
   bool get isOptedOut => _optedOut;
 
+  /// The language set with [setAppLanguage] (a BCP 47 tag), or null.
+  String? get appLanguage => _appLanguage;
+
   /// Number of operations currently buffered (visible for tests/diagnostics).
   @visibleForTesting
   int get pendingCount => _queue.length;
@@ -136,6 +185,10 @@ class WhisperrClient {
   /// handle, opt-out), starts the periodic flusher, attaches the app-lifecycle
   /// observer (background flush and automatic events), and sends the launch's
   /// automatic events (`app_installed` / `app_updated`, `app_opened`).
+  ///
+  /// With a stored user it also queues one restore identify (see
+  /// [WhisperrOptions.restoreIdentifyDelay]), and it sends the last push
+  /// token again when it was sent more than 7 days ago.
   Future<void> start() async {
     if (_started) return;
     _started = true;
@@ -153,12 +206,28 @@ class WhisperrClient {
       }
     }
 
-    // Resolved once per launch; screen() and trackPushOpened() use it too.
+    // Resolved once per launch: event context, automatic events and push
+    // registrations use it.
     try {
       _appContext = Map<String, Object?>.of(await _appContextResolver());
     } catch (e) {
       _log('app context unavailable ($e)');
     }
+
+    await _scheduleRestoreIdentify();
+    final language = _languageBeforeStart;
+    _languageBeforeStart = null;
+    if (language != null) {
+      await _guard(() => _mutateIdentity(() => _setAppLanguage(language.tag)));
+    }
+    if (_optedOut) _pendingPushToken = null;
+    final pending = _pendingPushToken;
+    if (pending != null) {
+      // Set before start(): fill in what the app context knows now.
+      await _guard(() => _mutateIdentity(() => _sendPushToken(
+          _registrationFromMeta(pending.address, _pushMeta(pending)))));
+    }
+    await _guard(() => _mutateIdentity(_reRegisterStalePushToken));
 
     if (_options.trackAutomaticEvents) {
       await _trackLaunch(hadPriorState: hadPriorState);
@@ -207,7 +276,12 @@ class WhisperrClient {
   /// an IANA zone name without a plugin) are filled in by default so the engine
   /// can pick the message language and approximate quiet hours; any value you
   /// pass in [traits] wins, and supplying `timezone` (an IANA name) drops the
-  /// offset fallback. See [defaultDeviceTraits].
+  /// offset fallback. See [defaultDeviceTraits]. The language set with
+  /// [setAppLanguage] goes as `app_language`; a `traits['app_language']` you
+  /// pass wins.
+  ///
+  /// A push token this device already registered before identify (under its
+  /// [anonymousId]) rides along, so the user gets it at once.
   ///
   /// Enqueued durably and flushed in order; returns once buffered (call [flush]
   /// to await delivery). For channel revocations, set [requirePersistence] to
@@ -223,10 +297,17 @@ class WhisperrClient {
     String? preferredChannel,
     List<WhisperrChannel>? channels,
     bool requirePersistence = false,
-  }) => _mutateIdentity(() => _identify(externalUserId,
-      traits: traits, email: email, phone: phone, pushToken: pushToken,
-      preferredChannel: preferredChannel, channels: channels,
-      requirePersistence: requirePersistence));
+  }) {
+    if (externalUserId.trim().isNotEmpty) _identifyCalled = true;
+    return _mutateIdentity(() => _identify(externalUserId,
+        traits: traits,
+        email: email,
+        phone: phone,
+        pushToken: pushToken,
+        preferredChannel: preferredChannel,
+        channels: channels,
+        requirePersistence: requirePersistence));
+  }
 
   Future<void> _identify(
     String externalUserId, {
@@ -262,15 +343,17 @@ class WhisperrClient {
       if (phone != null && phone.trim().isNotEmpty)
         WhisperrChannel.sms(phone.trim(), optedIn: true),
       if (pushToken != null && pushToken.trim().isNotEmpty)
-        WhisperrChannel.push(pushToken.trim(), optedIn: true),
+        _pushRegistration(pushToken.trim()),
       ...?channels,
     ];
-    // A token buffered by setPushToken() rides along unless the caller
-    // supplied its own push channel — or the pair was already delivered
-    // (e.g. restored after a restart), in which case re-sending is redundant.
-    // A token held back while notifications are denied stays held back.
+    // The known token rides along: one buffered by setPushToken(), or one
+    // registered before identify under this device's anonymous handle. Not
+    // when the caller supplied its own push channel, or the pair was already
+    // delivered for this user (e.g. restored after a restart). A token held
+    // back while notifications are denied stays held back.
     final denied = _permission.current == WhisperrPushPermission.denied;
-    final pending = denied ? null : _pendingPushToken;
+    final pending =
+        denied ? null : (_pendingPushToken ?? _anonymousPushRegistration());
     if (pending != null &&
         !resolved.any((c) => c.type == WhisperrChannelType.push) &&
         !(_lastPushUserId == id && _lastPushToken == pending.address)) {
@@ -302,6 +385,13 @@ class WhisperrClient {
     if (anonymousId != null) body['anonymous_id'] = anonymousId;
     final mergedTraits = _withDeviceTraits(traits);
     if (mergedTraits.isNotEmpty) body['traits'] = mergedTraits;
+    // The restore traits as this identify delivers them: once it is
+    // accepted, a restore identify with the same values is redundant.
+    final restoreKeys = _withDeviceTraits(null).keys;
+    final restoreTraits = <String, dynamic>{
+      for (final k in restoreKeys)
+        if (mergedTraits.containsKey(k)) k: mergedTraits[k],
+    };
     if (preferredChannel != null && preferredChannel.trim().isNotEmpty) {
       body['preferred_channel'] = preferredChannel.trim();
     }
@@ -310,7 +400,11 @@ class WhisperrClient {
     }
 
     await _enqueue(
-      WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: body),
+      WhisperrQueueOp(
+          id: _nextId(),
+          kind: WhisperrOpKind.identify,
+          body: body,
+          restoreTraits: restoreTraits),
       requirePersistence: requirePersistence,
       afterAccepted: () async {
         await _rememberPushChannel(id, resolved);
@@ -322,26 +416,30 @@ class WhisperrClient {
 
   /// Captures the device push token.
   ///
-  /// With a known user this re-identifies the push channel immediately: a
-  /// rotated token opts the previously sent one out, and setting the same
-  /// token again is a no-op — the last-sent (user, token) pair is persisted,
-  /// so this holds across app restarts too (safe to wire to `onTokenRefresh`
-  /// or call on every launch). Called before [identify], the token is buffered
-  /// in memory and attached to the next identify.
+  /// The SDK sends it at once in a partial identify: under the current user,
+  /// or before [identify] under this device's [anonymousId] (an anonymous
+  /// identify), so the device can get push before sign-in. [identify] later
+  /// attaches it to the user. A rotated token opts the previously sent one
+  /// out, and setting the same token again is a no-op — the last-sent
+  /// (subject, token) pair is persisted, so this holds across app restarts
+  /// too (safe to wire to `onTokenRefresh` or call on every launch). The
+  /// same token goes out again once it was sent more than 7 days ago.
   ///
   /// Token metadata (SPEC.md → Token kind) tells the server which provider
   /// can send to the token. Send what you know:
   ///
   /// - [kind] — `fcm` for a `firebase_messaging` token, `apns` for a raw
   ///   APNs token, `expo`, or `oneSignalSubscription`.
-  /// - [platform] — the OS family. When you pass any metadata it defaults to
-  ///   the OS the app runs on.
+  /// - [platform] — the OS family. It defaults to the OS the app runs on.
   /// - [pushEnv] — APNs tokens only: `sandbox` for development-signed builds,
   ///   `production` for TestFlight and the App Store. Never guessed.
+  /// - [providerProject] — the provider project of the token: the Firebase
+  ///   project id for an FCM token.
   ///
-  /// Without metadata the token is sent alone and the server infers the kind.
-  /// A token re-sent with new metadata goes out once more; a bare token never
-  /// removes metadata already sent.
+  /// The SDK adds `client_app_id` (the bundle id / package name) when it can
+  /// read it. Without [kind] the server infers the kind. A token re-sent with
+  /// new metadata goes out once more; a bare token never removes metadata
+  /// already sent.
   ///
   /// While the last reported permission ([setPushPermission]) is denied, the
   /// token is held back and sent when the permission comes back.
@@ -350,15 +448,20 @@ class WhisperrClient {
     WhisperrPushTokenKind? kind,
     String? platform,
     WhisperrPushEnvironment? pushEnv,
+    String? providerProject,
   }) =>
       _mutateIdentity(() => _setPushToken(token,
-          kind: kind, platform: platform, pushEnv: pushEnv));
+          kind: kind,
+          platform: platform,
+          pushEnv: pushEnv,
+          providerProject: providerProject));
 
   Future<void> _setPushToken(
     String token, {
     WhisperrPushTokenKind? kind,
     String? platform,
     WhisperrPushEnvironment? pushEnv,
+    String? providerProject,
   }) async {
     _ensureUsable();
     if (_optedOut) return;
@@ -368,40 +471,142 @@ class WhisperrClient {
     // safe to call on every launch, so it must be a no-op (not an error).
     if (t.isEmpty) return;
     final channel = _pushRegistration(t,
-        kind: kind, platform: platform, pushEnv: pushEnv);
-    final uid = _currentUserId;
-    if (uid == null || _permission.current == WhisperrPushPermission.denied) {
-      _pendingPushToken = channel; // the next identify() / allowed report
+        kind: kind,
+        platform: platform,
+        pushEnv: pushEnv,
+        providerProject: providerProject);
+    if (!_started) {
+      // Before start() the stored user is not known yet: start() sends it.
+      _pendingPushToken = channel;
       return;
     }
-    final last = _lastPushUserId == uid ? _lastPushToken : null;
+    await _restoring;
+    await _sendPushToken(channel);
+  }
+
+  /// Sends [channel] under the current subject, unless it is held (denied)
+  /// or already sent.
+  Future<void> _sendPushToken(WhisperrChannel channel) async {
+    if (_closed || _optedOut) return;
+    final t = channel.address;
+    if (_permission.current == WhisperrPushPermission.denied) {
+      _pendingPushToken = channel; // sent when the permission comes back
+      return;
+    }
+    final subject = _pushSubject();
+    final last = _pairMatches(subject) ? _lastPushToken : null;
     final meta = _pushMeta(channel);
-    // Refresh storm — token unchanged, and nothing new to say about it.
-    if (last == t && (meta.isEmpty || meta == (_lastPushMeta ?? ''))) {
+    // Refresh storm — token unchanged, nothing new to say about it, and sent
+    // recently enough.
+    if (last == t && _metaCovered(meta, _lastPushMeta) && _pushPairFresh) {
       _pendingPushToken = null;
       return;
     }
+    await _registerPush(subject, channel, retire: last);
+  }
+
+  /// Queues a partial identify for [subject] that opts [retire] out (a
+  /// rotation) and [registration] in. Records the pair once the queue
+  /// accepted it. Rejected storage/capacity changes stay retryable on the
+  /// next token refresh.
+  Future<void> _registerPush(
+    Map<String, String> subject,
+    WhisperrChannel registration, {
+    String? retire,
+  }) async {
     final channels = <WhisperrChannel>[
-      // Rotation: retire the token this client previously registered.
-      if (last != null && last != t) WhisperrChannel.push(last, optedIn: false),
-      channel,
+      if (retire != null && retire != registration.address)
+        WhisperrChannel.push(retire, optedIn: false),
+      registration,
     ];
-    final body = <String, dynamic>{
-      'external_user_id': uid,
-      'channels': channels.map((c) => c.toJson()).toList(),
-    };
-    // Remember only accepted registrations. Rejected storage/capacity changes
-    // must remain retryable on the next token refresh.
-    await _enqueue(WhisperrQueueOp(
-        id: _nextId(), kind: WhisperrOpKind.identify, body: body),
-        afterAccepted: () async {
-          _lastPushUserId = uid;
-          _lastPushToken = t;
-          _lastPushMeta = meta.isEmpty ? null : meta;
-          await _persistPushState();
-          _pendingPushToken = null;
-        });
+    await _enqueue(
+      WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: {
+        ...subject,
+        'channels': channels.map((c) => c.toJson()).toList(),
+      }),
+      afterAccepted: () async {
+        _setPushPair(subject, registration);
+        _pendingPushToken = null;
+        await _persistPushState();
+      },
+    );
     unawaited(flush());
+  }
+
+  /// The subject a push token goes under now: the current user, else this
+  /// device's anonymous handle (created if needed).
+  Map<String, String> _pushSubject() {
+    final uid = _currentUserId;
+    if (uid != null) return {'external_user_id': uid};
+    return {'anonymous_id': _ensureAnonymousId()};
+  }
+
+  /// Like [_pushSubject], but null instead of creating a handle.
+  Map<String, String>? _currentPushSubject() {
+    final uid = _currentUserId;
+    if (uid != null) return {'external_user_id': uid};
+    final anon = _anonymousId;
+    return anon == null ? null : {'anonymous_id': anon};
+  }
+
+  /// The subject of the last-sent pair, or null.
+  Map<String, String>? get _pairSubject {
+    final uid = _lastPushUserId;
+    if (uid != null) return {'external_user_id': uid};
+    final anon = _lastPushAnonymousId;
+    return anon == null ? null : {'anonymous_id': anon};
+  }
+
+  /// Whether the last-sent pair belongs to [subject].
+  bool _pairMatches(Map<String, String> subject) {
+    final uid = subject['external_user_id'];
+    if (uid != null) return _lastPushUserId == uid;
+    final anon = subject['anonymous_id'];
+    return anon != null && _lastPushAnonymousId == anon;
+  }
+
+  /// Whether the last-sent pair was sent less than 7 days ago.
+  bool get _pushPairFresh {
+    final at = _lastPushSentAt;
+    return at != null && _clock().difference(at) < _pushReRegisterAfter;
+  }
+
+  void _setPushPair(Map<String, String> subject, WhisperrChannel channel) {
+    final meta = _pushMeta(channel);
+    _lastPushUserId = subject['external_user_id'];
+    _lastPushAnonymousId =
+        _lastPushUserId == null ? subject['anonymous_id'] : null;
+    _lastPushToken = channel.address;
+    _lastPushMeta = meta.isEmpty ? null : meta;
+    _lastPushSentAt = _clock();
+  }
+
+  void _clearPushPair() {
+    _lastPushUserId = null;
+    _lastPushAnonymousId = null;
+    _lastPushToken = null;
+    _lastPushMeta = null;
+    _lastPushSentAt = null;
+  }
+
+  /// The token this device registered before identify, under its current
+  /// anonymous handle, as an opted-in registration; null when there is none.
+  WhisperrChannel? _anonymousPushRegistration() {
+    final token = _lastPushToken;
+    final anon = _lastPushAnonymousId;
+    if (token == null || anon == null || anon != _anonymousId) return null;
+    return _registrationFromMeta(token, _lastPushMeta);
+  }
+
+  /// At launch: sends the last push token again when it was sent more than
+  /// 7 days ago, under the same subject, if that subject is still current.
+  Future<void> _reRegisterStalePushToken() async {
+    final token = _lastPushToken;
+    if (_closed || _optedOut || token == null || _pushPairFresh) return;
+    if (_permission.current == WhisperrPushPermission.denied) return;
+    final subject = _currentPushSubject();
+    if (subject == null || !_pairMatches(subject)) return;
+    await _registerPush(subject, _registrationFromMeta(token, _lastPushMeta));
   }
 
   /// Reports the OS notification permission. Safe to call on every launch and
@@ -417,7 +622,8 @@ class WhisperrClient {
   ///
   /// `denied` also opts out the push token this client registered and holds
   /// it, so the engine stops choosing push for this device; `granted` /
-  /// `provisional` registers it again.
+  /// `provisional` registers it again (under the user, or before [identify]
+  /// under the [anonymousId]).
   Future<void> setPushPermission(WhisperrPushPermission status) =>
       _mutateIdentity(() => _setPushPermission(status));
 
@@ -436,93 +642,120 @@ class WhisperrClient {
     await _persistPermission();
     if (report) unawaited(flush());
 
-    final uid = _currentUserId;
-    if (_optedOut || uid == null) return;
-    final last = _lastPushUserId == uid ? _lastPushToken : null;
+    if (_optedOut) return;
     if (status == WhisperrPushPermission.denied) {
-      if (last == null) return;
+      final subject = _currentPushSubject();
+      final last =
+          subject != null && _pairMatches(subject) ? _lastPushToken : null;
+      if (subject == null || last == null) return;
       // Stop push to this device; hold the token so it registers again as
       // soon as the permission comes back.
       await _enqueue(
         WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: {
-          'external_user_id': uid,
+          ...subject,
           'channels': [WhisperrChannel.push(last, optedIn: false).toJson()],
         }),
         afterAccepted: () async {
           _pendingPushToken ??= _registrationFromMeta(last, _lastPushMeta);
-          _lastPushUserId = null;
-          _lastPushToken = null;
-          _lastPushMeta = null;
+          _clearPushPair();
           await _persistPushState();
         },
       );
+      unawaited(flush());
     } else if (status.allowsPush) {
       final reg = _pendingPushToken;
       if (reg == null) return;
+      final subject = _pushSubject();
+      final last = _pairMatches(subject) ? _lastPushToken : null;
       if (last == reg.address) {
         _pendingPushToken = null; // already registered
         return;
       }
-      await _enqueue(
-        WhisperrQueueOp(id: _nextId(), kind: WhisperrOpKind.identify, body: {
-          'external_user_id': uid,
-          'channels': [
-            if (last != null) WhisperrChannel.push(last, optedIn: false).toJson(),
-            reg.toJson(),
-          ],
-        }),
-        afterAccepted: () async {
-          final meta = _pushMeta(reg);
-          _lastPushUserId = uid;
-          _lastPushToken = reg.address;
-          _lastPushMeta = meta.isEmpty ? null : meta;
-          _pendingPushToken = null;
-          await _persistPushState();
-        },
-      );
-    } else {
-      return;
+      await _registerPush(subject, reg, retire: last);
     }
-    unawaited(flush());
   }
 
-  /// An opted-in push channel for [token] with the metadata the caller knows.
-  /// With any metadata, an Expo token gets `kind: expo` and the platform
-  /// defaults to this device's OS family.
+  /// An opted-in push channel for [token] with the metadata the caller knows,
+  /// plus what the SDK knows: the platform (this device's OS family) and the
+  /// `client_app_id` (from the app context). With caller metadata, an Expo
+  /// token gets `kind: expo`.
   WhisperrChannel _pushRegistration(
     String token, {
     WhisperrPushTokenKind? kind,
     String? platform,
     WhisperrPushEnvironment? pushEnv,
+    String? providerProject,
   }) {
-    final hasMeta = kind != null || platform != null || pushEnv != null;
+    final hasMeta = kind != null ||
+        platform != null ||
+        pushEnv != null ||
+        providerProject != null;
     final explicit = platform?.trim().toLowerCase();
-    final os = explicit != null && _pushPlatforms.contains(explicit)
-        ? explicit
-        : (hasMeta ? osFamily() : null);
+    final contextOs = _appContext['platform'];
+    final String? os;
+    if (explicit != null && _pushPlatforms.contains(explicit)) {
+      os = explicit;
+    } else if (contextOs is String && _pushPlatforms.contains(contextOs)) {
+      os = contextOs;
+    } else if (hasMeta) {
+      os = osFamily();
+    } else {
+      os = null;
+    }
+    final appId = _appContext[kClientAppIdKey];
+    final project = providerProject?.trim();
+    final resolvedKind = kind ??
+        (hasMeta && _expoPushToken.hasMatch(token)
+            ? WhisperrPushTokenKind.expo
+            : null);
+    final apns = resolvedKind == WhisperrPushTokenKind.apns;
     return WhisperrChannel.push(
       token,
       optedIn: true,
-      kind: kind ??
-          (hasMeta && _expoPushToken.hasMatch(token)
-              ? WhisperrPushTokenKind.expo
-              : null),
+      kind: resolvedKind,
       platform: os != null && _pushPlatforms.contains(os) ? os : null,
-      pushEnv: pushEnv,
+      // push_env is for APNs tokens only; provider_project never is.
+      pushEnv: resolvedKind == null || apns ? pushEnv : null,
+      clientAppId: appId is String && appId.isNotEmpty ? appId : null,
+      providerProject:
+          project == null || project.isEmpty || apns ? null : project,
     );
   }
 
   /// A stable signature of a push channel's metadata ('' when it has none).
   static String _pushMeta(WhisperrChannel c) {
-    if (c.kind == null && c.platform == null && c.pushEnv == null) return '';
+    if (c.kind == null &&
+        c.platform == null &&
+        c.pushEnv == null &&
+        c.clientAppId == null &&
+        c.providerProject == null) {
+      return '';
+    }
     return '${c.kind?.wireValue ?? ''}|${c.platform ?? ''}|'
-        '${c.pushEnv?.wireValue ?? ''}';
+        '${c.pushEnv?.wireValue ?? ''}|${c.clientAppId ?? ''}|'
+        '${c.providerProject ?? ''}';
   }
 
-  /// Rebuilds an opted-in registration from a [_pushMeta] signature.
-  static WhisperrChannel _registrationFromMeta(String token, String? meta) {
+  /// Whether [meta] says nothing new next to [sent]: each field it has is the
+  /// same in [sent]. So a token sent with less metadata (a bare token) never
+  /// replaces what was already sent.
+  static bool _metaCovered(String meta, String? sent) {
+    if (meta.isEmpty) return true;
+    final fields = meta.split('|');
+    final known = (sent ?? '').split('|');
+    for (var i = 0; i < fields.length; i++) {
+      if (fields[i].isEmpty) continue;
+      if (i >= known.length || known[i] != fields[i]) return false;
+    }
+    return true;
+  }
+
+  /// Rebuilds an opted-in registration from a [_pushMeta] signature. A field
+  /// the signature lacks (one stored by an older SDK) gets the SDK default.
+  WhisperrChannel _registrationFromMeta(String token, String? meta) {
     final parts = (meta ?? '').split('|');
-    String? at(int i) => i < parts.length && parts[i].isNotEmpty ? parts[i] : null;
+    String? at(int i) =>
+        i < parts.length && parts[i].isNotEmpty ? parts[i] : null;
     WhisperrPushTokenKind? kind;
     for (final k in WhisperrPushTokenKind.values) {
       if (k.wireValue == at(0)) kind = k;
@@ -531,8 +764,17 @@ class WhisperrClient {
     for (final e in WhisperrPushEnvironment.values) {
       if (e.wireValue == at(2)) env = e;
     }
+    final registration = _pushRegistration(token,
+        kind: kind, platform: at(1), pushEnv: env, providerProject: at(4));
+    final appId = at(3);
+    if (appId == null) return registration;
     return WhisperrChannel.push(token,
-        optedIn: true, kind: kind, platform: at(1), pushEnv: env);
+        optedIn: true,
+        kind: registration.kind,
+        platform: registration.platform,
+        pushEnv: registration.pushEnv,
+        clientAppId: appId,
+        providerProject: registration.providerProject);
   }
 
   /// Forwards every token a stream emits to [setPushToken]. Plugs directly
@@ -546,13 +788,15 @@ class WhisperrClient {
   /// The subscription is also tracked and cancelled by [close], so a token
   /// emitted after the client is torn down can never reach it.
   ///
-  /// [kind], [platform] and [pushEnv] are passed to [setPushToken] for every
-  /// token, for example `kind: WhisperrPushTokenKind.fcm`.
+  /// [kind], [platform], [pushEnv] and [providerProject] are passed to
+  /// [setPushToken] for every token, for example
+  /// `kind: WhisperrPushTokenKind.fcm`.
   StreamSubscription<String> attachPushTokenStream(
     Stream<String> tokens, {
     WhisperrPushTokenKind? kind,
     String? platform,
     WhisperrPushEnvironment? pushEnv,
+    String? providerProject,
   }) {
     final sub = tokens.listen(
       (token) {
@@ -560,7 +804,10 @@ class WhisperrClient {
         // between emission and delivery). Guard it so a throw never escapes as
         // an uncaught zone error and crashes the app — report and move on.
         unawaited(setPushToken(token,
-                kind: kind, platform: platform, pushEnv: pushEnv)
+                kind: kind,
+                platform: platform,
+                pushEnv: pushEnv,
+                providerProject: providerProject)
             .catchError((Object error) {
           _log('setPushToken from stream failed: $error');
         }));
@@ -574,6 +821,80 @@ class WhisperrClient {
     return sub;
   }
 
+  /// Sets the language the user picked in the app (not the device locale),
+  /// as a BCP 47 tag such as `de` or `pt-BR`. `_` becomes `-`, so
+  /// `Locale.toString()` (`pt_BR`) works. An invalid tag is ignored (with a
+  /// debug log). Whisperr writes messages in this language.
+  ///
+  /// The SDK persists it and sends it at once as the trait `app_language`:
+  /// under the current user, or before [identify] under this device's
+  /// [anonymousId]. Every [identify] and restore identify carries it. The
+  /// same value again sends nothing. `null` clears the stored value and sends
+  /// nothing; the server keeps the last value it got. [reset] keeps it.
+  Future<void> setAppLanguage(String? languageTag) =>
+      _mutateIdentity(() => _setAppLanguage(languageTag));
+
+  Future<void> _setAppLanguage(String? languageTag) async {
+    _ensureUsable();
+    if (!_started) {
+      _languageBeforeStart = (tag: languageTag);
+      return;
+    }
+    await _restoring;
+    if (languageTag == null) {
+      _appLanguage = null;
+      await _persistAppLanguage();
+      // The server keeps the last value, so a restore without it says
+      // nothing new.
+      final sent = _identifySent;
+      if (sent != null && sent.traits.containsKey('app_language')) {
+        _identifySent = (
+          user: sent.user,
+          traits: {...sent.traits}..remove('app_language'),
+          at: sent.at,
+        );
+        await _persistIdentifySent();
+      }
+      return;
+    }
+    final tag = normalizeLanguageTag(languageTag);
+    if (tag == null) {
+      _log('setAppLanguage("$languageTag") ignored: not a BCP 47 tag');
+      return;
+    }
+    if (tag == _appLanguage) return;
+    _appLanguage = tag;
+    await _persistAppLanguage();
+    if (_optedOut) return;
+    final subject = _pushSubject();
+    await _enqueue(WhisperrQueueOp(
+      id: _nextId(),
+      kind: WhisperrOpKind.identify,
+      body: {
+        ...subject,
+        'traits': {'app_language': tag},
+      },
+      restoreTraits: subject.containsKey('external_user_id')
+          ? {'app_language': tag}
+          : null,
+      restoreMerge: true,
+    ));
+    unawaited(flush());
+  }
+
+  Future<void> _persistAppLanguage() async {
+    try {
+      final tag = _appLanguage;
+      if (tag == null) {
+        await _persistence.clear(WhisperrPersistence.appLanguageSlot);
+      } else {
+        await _persistence.save(WhisperrPersistence.appLanguageSlot, tag);
+      }
+    } catch (e) {
+      _log('failed to persist app language ($e)');
+    }
+  }
+
   /// Tracks a product event for the current (or explicitly given) user.
   ///
   /// [eventType] should be snake_case (the backend rejects other shapes).
@@ -582,6 +903,10 @@ class WhisperrClient {
   ///
   /// Before [identify] the event is sent under this device's [anonymousId];
   /// the next identify merges it into the user. A no-op while opted out.
+  ///
+  /// The event `context` carries `app_version`, `app_build`, `platform`,
+  /// `sdk_name` and `sdk_version` (a key the platform cannot provide is
+  /// absent). A key you pass in [context] wins.
   Future<void> track(
     String eventType, {
     Map<String, dynamic>? properties,
@@ -608,6 +933,7 @@ class WhisperrClient {
     // (the queue is durable) so the server can dedup at-least-once redelivery.
     final messageId = _nextId();
     final mergedContext = <String, dynamic>{
+      ..._eventContext(),
       if (context != null) ...context,
       r'$message_id': messageId,
     };
@@ -649,14 +975,21 @@ class WhisperrClient {
   /// `FirebaseMessaging.onMessageOpenedApp` and `getInitialMessage()`.
   ///
   /// When [data] carries `whisperr_message_id` (Whisperr stamps it on every
-  /// push it sends), this sends `push_opened` with `whisperr_message_id` and,
-  /// if present, `deep_link` (read from `whisperr_deep_link`, else
-  /// `deep_link`), and returns true. Other pushes are ignored and return
+  /// push it sends), this sends `push_opened` with `whisperr_message_id`,
+  /// `deep_link` if present (read from `whisperr_deep_link`, else
+  /// `deep_link`), `action_id` ([actionId]: the id of the tapped button, or
+  /// `default` for a tap on the notification) and `cold_start` when you pass
+  /// [coldStart] (true when the tap launched the app, as with
+  /// `getInitialMessage()`), and returns true. Other pushes are ignored and return
   /// false. A message id already reported is ignored too (the last 50 ids are
   /// remembered across restarts), so calling it from both hooks is safe.
   ///
   /// To route the tap, read the deep link with [WhisperrPushOpen.fromData].
-  Future<bool> trackPushOpened(Map<String, dynamic> data) async {
+  Future<bool> trackPushOpened(
+    Map<String, dynamic> data, {
+    String? actionId,
+    bool? coldStart,
+  }) async {
     _ensureUsable();
     if (_optedOut) return false;
     final open = WhisperrPushOpen.fromData(data);
@@ -669,9 +1002,48 @@ class WhisperrClient {
     }
     await _persistPushOpened();
     final deepLink = open.deepLink;
+    final action = actionId?.trim();
     await _trackSdkEvent('push_opened', {
       'whisperr_message_id': id,
       if (deepLink != null) 'deep_link': deepLink,
+      'action_id': action == null || action.isEmpty ? 'default' : action,
+      if (coldStart != null) 'cold_start': coldStart,
+    });
+    unawaited(flush());
+    return true;
+  }
+
+  /// Reports that a push reached the app while it was in the foreground.
+  /// Pass the push data payload (for `firebase_messaging`:
+  /// `RemoteMessage.data` from `FirebaseMessaging.onMessage`).
+  ///
+  /// When [data] carries `whisperr_message_id`, this sends `push_received`
+  /// with `whisperr_message_id`, `foreground: true` and
+  /// `source: foreground`, and returns true. Other pushes, and a message id
+  /// already reported (the last 50 are remembered across restarts), are
+  /// ignored and return false. It does not count as user activity. It is an
+  /// automatic event: [WhisperrOptions.trackAutomaticEvents] off sends none.
+  Future<bool> trackPushReceived(Map<String, dynamic> data) async {
+    _ensureUsable();
+    if (_optedOut || !_options.trackAutomaticEvents) return false;
+    final push = WhisperrPushOpen.fromData(data);
+    if (push == null || _pushReceived.contains(push.messageId)) return false;
+    final id = push.messageId;
+    // Mark before any await so a concurrent call for the same id is a no-op.
+    _pushReceived.add(id);
+    while (_pushReceived.length > _maxRememberedPushOpens) {
+      _pushReceived.removeAt(0);
+    }
+    try {
+      await _persistence.save(
+          WhisperrPersistence.pushReceivedSlot, jsonEncode(_pushReceived));
+    } catch (e) {
+      _log('failed to persist push-received ids ($e)');
+    }
+    await _trackSdkEvent('push_received', {
+      'whisperr_message_id': id,
+      'foreground': true,
+      'source': 'foreground',
     });
     unawaited(flush());
     return true;
@@ -721,21 +1093,19 @@ class WhisperrClient {
   }
 
   /// The identify that opts this device's last-sent push token out, under
-  /// the user it was sent for. Forgets the pair, so the token registers
+  /// the subject (user or anonymous handle) it was sent for. Forgets the pair, so the token registers
   /// again after [optIn].
   WhisperrQueueOp? _takePushOptOut() {
-    final uid = _lastPushUserId;
+    final subject = _pairSubject;
     final token = _lastPushToken;
-    _lastPushUserId = null;
-    _lastPushToken = null;
-    _lastPushMeta = null;
-    if (uid == null || token == null) return null;
+    _clearPushPair();
+    if (subject == null || token == null) return null;
     return WhisperrQueueOp(
       id: _nextId(),
       kind: WhisperrOpKind.identify,
       optOut: true,
       body: {
-        'external_user_id': uid,
+        ...subject,
         'channels': [WhisperrChannel.push(token, optedIn: false).toJson()],
       },
     );
@@ -778,9 +1148,13 @@ class WhisperrClient {
   }
 
   /// Clears the current user (e.g. on logout) after flushing pending work.
-  /// Also clears the persisted identity and last-sent push-token pair, so the
-  /// next user's `setPushToken` re-registers the device, and rotates the
-  /// [anonymousId], so the next person on this device is a new visitor.
+  /// Also clears the persisted identity and rotates the [anonymousId], so the
+  /// next person on this device is a new visitor.
+  ///
+  /// The push token moves with the device: when this client registered one,
+  /// reset opts it out under the old user, then opts it in under the new
+  /// [anonymousId], so the device can still get push while signed out. The
+  /// next [identify] attaches it to the new user. [appLanguage] stays.
   /// Set [flushBeforeReset] to false for interactive logout: clear identity
   /// locally while queued operations retain their original user and drain in
   /// the background. An offline transport cannot delay the next login.
@@ -789,11 +1163,14 @@ class WhisperrClient {
 
   Future<void> _reset({required bool flushBeforeReset}) async {
     if (flushBeforeReset) await flush();
+    _restoreTimer?.cancel();
+    _restoreTimer = null;
+    final oldSubject = _pairSubject;
+    final token = _lastPushToken;
+    final moved =
+        token == null ? null : _registrationFromMeta(token, _lastPushMeta);
     _currentUserId = null;
-    _pendingPushToken = null;
-    _lastPushToken = null;
-    _lastPushUserId = null;
-    _lastPushMeta = null;
+    _clearPushPair();
     // The device permission stays; the next report sends it again.
     _permission = WhisperrPermissionRecord(current: _permission.current);
     _anonymousId = null;
@@ -801,6 +1178,28 @@ class WhisperrClient {
     await _persistPushState();
     await _persistPermission();
     await _persistAnonymousId();
+    if (!_optedOut && oldSubject != null && token != null && moved != null) {
+      // (1) Opt the token out under the old user. (2) The handle is rotated
+      // above. (3) Opt it in under the new handle. A full queue must not
+      // fail the logout: the next setPushToken registers the token again.
+      try {
+        await _enqueue(WhisperrQueueOp(
+            id: _nextId(),
+            kind: WhisperrOpKind.identify,
+            body: {
+              ...oldSubject,
+              'channels': [
+                WhisperrChannel.push(token, optedIn: false).toJson()
+              ],
+            }));
+        if (_permission.current != WhisperrPushPermission.denied) {
+          await _registerPush({'anonymous_id': _ensureAnonymousId()}, moved);
+        }
+      } catch (e) {
+        _emit('dropped', 'reset could not move the push token');
+        _log('reset could not move the push token ($e)');
+      }
+    }
     if (!flushBeforeReset) unawaited(flush());
   }
 
@@ -812,6 +1211,8 @@ class WhisperrClient {
     _closed = true;
     _timer?.cancel();
     _timer = null;
+    _restoreTimer?.cancel();
+    _restoreTimer = null;
     _lifecycle?.dispose();
     _lifecycle = null;
     for (final sub in _pushSubscriptions) {
@@ -833,7 +1234,8 @@ class WhisperrClient {
     // A process started in the background (e.g. by a push) is not an open:
     // report the cold start when the app first comes to the foreground.
     final state = _currentLifecycleState();
-    if (state == AppLifecycleState.hidden || state == AppLifecycleState.paused) {
+    if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused) {
       _inBackground = true;
       _coldOpenPending = true;
       return;
@@ -868,7 +1270,8 @@ class WhisperrClient {
       await _trackSdkEvent('app_updated', {
         'app_version': version,
         if (build != null) 'app_build': build,
-        if (previous['version'] != null) 'previous_version': previous['version'],
+        if (previous['version'] != null)
+          'previous_version': previous['version'],
         if (previous['build'] != null) 'previous_build': previous['build'],
       });
     }
@@ -921,8 +1324,14 @@ class WhisperrClient {
       'sdk_version': kWhisperrSdkVersion,
     };
     _appContext.forEach((k, v) {
-      if (v != null) out[k] = v;
+      if (v != null && k != kClientAppIdKey) out[k] = v;
     });
+    // The SDK always knows the OS family, also when the app context is off.
+    final os = out['platform'] ?? osFamily();
+    if (os != null) {
+      out.putIfAbsent('platform', () => os);
+      out.putIfAbsent('os_name', () => os);
+    }
     _resolveDeviceTraits().forEach((k, v) {
       if (v != null) out[k] = v;
     });
@@ -931,6 +1340,121 @@ class WhisperrClient {
       out.remove('timezone');
     }
     return out;
+  }
+
+  /// The environment keys every event carries in `context` (spec C5):
+  /// `app_version`, `app_build`, `platform`, `sdk_name`, `sdk_version`.
+  /// Never `locale`: the server reads `context.locale` as the message
+  /// language of that event.
+  Map<String, dynamic> _eventContext() => {
+        for (final key in const ['app_version', 'app_build', 'platform'])
+          if (_appContext[key] != null) key: _appContext[key],
+        'sdk_name': kWhisperrSdkName,
+        'sdk_version': kWhisperrSdkVersion,
+      };
+
+  /// Queues the restore identify now, or after
+  /// [WhisperrOptions.restoreIdentifyDelay], when a user is stored.
+  Future<void> _scheduleRestoreIdentify() async {
+    final uid = _currentUserId;
+    if (uid == null || _optedOut) return;
+    final delay = _options.restoreIdentifyDelay;
+    if (delay <= Duration.zero) {
+      await _guard(() => _mutateIdentity(() => _queueRestoreIdentify(uid)));
+      return;
+    }
+    _restoreTimer = Timer(delay, () {
+      _restoreTimer = null;
+      unawaited(
+          _guard(() => _mutateIdentity(() => _queueRestoreIdentify(uid))));
+    });
+  }
+
+  /// The restore identify (spec C1): `{external_user_id, anonymous_id,
+  /// traits: {device defaults, app_language}}`, no channels. Skipped when the
+  /// app called identify() in this process, the user changed, the device
+  /// opted out, the same traits went to the same user less than 24 hours
+  /// ago, or an identify with the same traits is still queued.
+  Future<void> _queueRestoreIdentify(String uid) async {
+    if (_closed || _optedOut || _identifyCalled || _currentUserId != uid) {
+      return;
+    }
+    final traits = _withDeviceTraits(null);
+    final fingerprint = _fingerprint(traits);
+    final sent = _identifySent;
+    if (sent != null &&
+        sent.user == uid &&
+        _fingerprint(sent.traits) == fingerprint &&
+        _clock().difference(sent.at) < _restoreIdentifyThrottle) {
+      _log('restore identify skipped: same traits sent less than 24 h ago');
+      return;
+    }
+    // Offline launches: one queued restore identify for these traits is
+    // enough.
+    if (_queue.any((op) =>
+        op.body['external_user_id'] == uid &&
+        op.restoreTraits != null &&
+        !op.restoreMerge &&
+        _fingerprint(op.restoreTraits!) == fingerprint)) {
+      return;
+    }
+    final anonymousId = _anonymousId;
+    await _enqueue(WhisperrQueueOp(
+      id: _nextId(),
+      kind: WhisperrOpKind.identify,
+      restoreTraits: traits,
+      body: {
+        'external_user_id': uid,
+        if (anonymousId != null) 'anonymous_id': anonymousId,
+        if (traits.isNotEmpty) 'traits': traits,
+      },
+    ));
+    unawaited(flush());
+  }
+
+  /// Stores what a delivered identify said about the restore traits. A
+  /// partial identify ([WhisperrQueueOp.restoreMerge]) updates the record of
+  /// the same user and keeps its time.
+  Future<void> _recordIdentifySent(WhisperrQueueOp op) async {
+    final traits = op.restoreTraits;
+    final user = op.body['external_user_id'];
+    if (traits == null || user is! String) return;
+    final sent = _identifySent;
+    if (op.restoreMerge) {
+      if (sent == null || sent.user != user) return;
+      _identifySent =
+          (user: user, traits: {...sent.traits, ...traits}, at: sent.at);
+    } else {
+      _identifySent = (user: user, traits: traits, at: _clock());
+    }
+    await _persistIdentifySent();
+  }
+
+  Future<void> _persistIdentifySent() async {
+    final sent = _identifySent;
+    try {
+      if (sent == null) {
+        await _persistence.clear(WhisperrPersistence.identifySentSlot);
+        return;
+      }
+      await _persistence.save(
+          WhisperrPersistence.identifySentSlot,
+          jsonEncode({
+            'user_id': sent.user,
+            'traits': sent.traits,
+            'at': sent.at.toUtc().toIso8601String(),
+          }));
+    } catch (e) {
+      _log('failed to persist identify record ($e)');
+    }
+  }
+
+  /// A stable signature of a traits map: its entries sorted by key.
+  static String _fingerprint(Map<String, dynamic> traits) {
+    final keys = traits.keys.toList()..sort();
+    return jsonEncode([
+      for (final k in keys) [k, traits[k]]
+    ]);
   }
 
   AppLifecycleState? _currentLifecycleState() {
@@ -987,10 +1511,11 @@ class WhisperrClient {
   /// the caller means "don't default a timezone" (nor the offset fallback).
   static const _timezoneKeys = ['timezone', 'time_zone', 'tz'];
 
-  /// Merges the device defaults *under* the caller's traits: caller values
-  /// always win, and a key the platform cannot provide is simply absent. Only
-  /// full identify() calls get defaults — [setPushToken]'s partial identify
-  /// stays traits-free by contract.
+  /// Merges the device defaults and the stored [appLanguage] *under* the
+  /// caller's traits: caller values always win, and a key the platform cannot
+  /// provide is simply absent. Only full identify() calls and the restore
+  /// identify get them — [setPushToken]'s partial identify stays traits-free
+  /// by contract.
   Map<String, dynamic> _withDeviceTraits(Map<String, dynamic>? traits) {
     final defaults = _resolveDeviceTraits();
     final supplied = traits ?? const <String, dynamic>{};
@@ -998,7 +1523,12 @@ class WhisperrClient {
       defaults.remove('timezone');
       defaults.remove('timezone_offset_minutes');
     }
-    return <String, dynamic>{...defaults, ...supplied};
+    final language = _appLanguage;
+    return <String, dynamic>{
+      ...defaults,
+      if (language != null) 'app_language': language,
+      ...supplied,
+    };
   }
 
   /// A failing resolver must never break identify(): log and send nothing.
@@ -1017,10 +1547,7 @@ class WhisperrClient {
     var changed = false;
     for (final c in channels) {
       if (c.type == WhisperrChannelType.push && (c.optedIn ?? true)) {
-        final meta = _pushMeta(c);
-        _lastPushUserId = userId;
-        _lastPushToken = c.address;
-        _lastPushMeta = meta.isEmpty ? null : meta;
+        _setPushPair({'external_user_id': userId}, c);
         changed = true;
       }
     }
@@ -1033,15 +1560,16 @@ class WhisperrClient {
   /// every future setPushToken. Clears the mark when a discarded op carried it.
   Future<void> _forgetPushMark(Iterable<WhisperrQueueOp> discarded) async {
     final token = _lastPushToken;
-    final user = _lastPushUserId;
-    if (token == null || user == null) return;
-    final discardedIds = discarded.map((op) => op.id).toSet();
-    if (_queue.any((op) {
-      if (discardedIds.contains(op.id) ||
-          op.kind != WhisperrOpKind.identify ||
-          op.body['external_user_id'] != user) {
-        return false;
-      }
+    final subject = _pairSubject;
+    if (token == null || subject == null) return;
+    bool carries(WhisperrQueueOp op) {
+      if (op.kind != WhisperrOpKind.identify) return false;
+      final uid = subject['external_user_id'];
+      final forSubject = uid != null
+          ? op.body['external_user_id'] == uid
+          : op.body['external_user_id'] == null &&
+              op.body['anonymous_id'] == subject['anonymous_id'];
+      if (!forSubject) return false;
       final channels = op.body['channels'];
       return channels is List &&
           channels.any(
@@ -1051,28 +1579,15 @@ class WhisperrClient {
                 c['address'] == token &&
                 (c['opted_in'] == null || c['opted_in'] == true),
           );
-    })) {
+    }
+
+    final discardedIds = discarded.map((op) => op.id).toSet();
+    if (_queue.any((op) => !discardedIds.contains(op.id) && carries(op))) {
       return;
     }
-    for (final op in discarded) {
-      if (op.kind != WhisperrOpKind.identify) continue;
-      if (op.body['external_user_id'] != user) continue;
-      final channels = op.body['channels'];
-      if (channels is! List) continue;
-      final carried = channels.any(
-        (c) =>
-            c is Map &&
-            c['channel'] == 'push' &&
-            c['address'] == token &&
-            (c['opted_in'] == null || c['opted_in'] == true),
-      );
-      if (carried) {
-        _lastPushUserId = null;
-        _lastPushToken = null;
-        _lastPushMeta = null;
-        await _persistPushState();
-        return;
-      }
+    if (discarded.any(carries)) {
+      _clearPushPair();
+      await _persistPushState();
     }
   }
 
@@ -1089,6 +1604,7 @@ class WhisperrClient {
         if (head.kind == WhisperrOpKind.identify) {
           await _api.identify(head.body);
           await _removeQueuedOps([head]);
+          await _recordIdentifySent(head);
         } else {
           final batch = <WhisperrQueueOp>[];
           for (final op in _queue) {
@@ -1150,7 +1666,12 @@ class WhisperrClient {
   // Resolve rotation against the last accepted control, not a concurrent
   // request's stale token snapshot. Reset shares this lane too.
   Future<void> _mutateIdentity(Future<void> Function() change) {
-    final result = _identityTail.then((_) => change());
+    // Once start() began, every identity change sees the restored state.
+    final restoring = _restoring;
+    final result = _identityTail.then((_) async {
+      if (restoring != null) await restoring;
+      return change();
+    });
     _identityTail = result.catchError((Object _) {});
     return result;
   }
@@ -1177,35 +1698,36 @@ class WhisperrClient {
     WhisperrQueueOp op, {
     bool requirePersistence = false,
     Future<void> Function()? afterAccepted,
-  }) => _mutateQueue(() async {
-    // An op that raced optOut() past its entry check is discarded.
-    if (_optedOut) return;
-    final next = [..._queue, op];
-    var dropped = 0;
-    while (next.length > _options.maxQueueSize) {
-      final event = next.indexWhere(
-        (entry) => entry.kind == WhisperrOpKind.track,
-      );
-      if (event == -1) {
-        throw StateError(
-          'Whisperr queue is full of pending identify operations',
-        );
-      }
-      next.removeAt(event);
-      dropped++;
-    }
-    await _persistQueue(next, requirePersistence: requirePersistence);
-    _queue
-      ..clear()
-      ..addAll(next);
-    await afterAccepted?.call();
-    if (dropped > 0) {
-      _emit(
-        'dropped',
-        'queue exceeded ${_options.maxQueueSize}; dropped $dropped telemetry event(s)',
-      );
-    }
-  });
+  }) =>
+      _mutateQueue(() async {
+        // An op that raced optOut() past its entry check is discarded.
+        if (_optedOut) return;
+        final next = [..._queue, op];
+        var dropped = 0;
+        while (next.length > _options.maxQueueSize) {
+          final event = next.indexWhere(
+            (entry) => entry.kind == WhisperrOpKind.track,
+          );
+          if (event == -1) {
+            throw StateError(
+              'Whisperr queue is full of pending identify operations',
+            );
+          }
+          next.removeAt(event);
+          dropped++;
+        }
+        await _persistQueue(next, requirePersistence: requirePersistence);
+        _queue
+          ..clear()
+          ..addAll(next);
+        await afterAccepted?.call();
+        if (dropped > 0) {
+          _emit(
+            'dropped',
+            'queue exceeded ${_options.maxQueueSize}; dropped $dropped telemetry event(s)',
+          );
+        }
+      });
 
   /// Restores persisted state. Returns whether any state from an earlier
   /// launch existed (queue, identity, push pair or anonymous handle).
@@ -1241,13 +1763,19 @@ class WhisperrClient {
       final raw = await _persistence.load(WhisperrPersistence.pushSlot);
       if (raw != null && raw.isNotEmpty) {
         final decoded = jsonDecode(raw);
+        final user = decoded is Map ? decoded['user_id'] : null;
+        final anon = decoded is Map ? decoded['anonymous_id'] : null;
         if (decoded is Map &&
-            decoded['user_id'] is String &&
+            (user is String || anon is String) &&
             decoded['token'] is String) {
-          _lastPushUserId = decoded['user_id'] as String;
+          _lastPushUserId = user is String ? user : null;
+          _lastPushAnonymousId = user is String ? null : anon as String;
           _lastPushToken = decoded['token'] as String;
           final meta = decoded['meta'];
           _lastPushMeta = meta is String && meta.isNotEmpty ? meta : null;
+          final sentAt = decoded['sent_at'];
+          _lastPushSentAt =
+              sentAt is String ? DateTime.tryParse(sentAt)?.toUtc() : null;
         }
       }
     } catch (e) {
@@ -1285,6 +1813,42 @@ class WhisperrClient {
       }
     } catch (e) {
       _log('failed to restore push-opened ids ($e)');
+    }
+    try {
+      final raw = await _persistence.load(WhisperrPersistence.pushReceivedSlot);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is List) _pushReceived.addAll(decoded.whereType<String>());
+      }
+    } catch (e) {
+      _log('failed to restore push-received ids ($e)');
+    }
+    try {
+      final raw = await _persistence.load(WhisperrPersistence.appLanguageSlot);
+      if (raw != null && raw.trim().isNotEmpty) _appLanguage = raw.trim();
+    } catch (e) {
+      _log('failed to restore app language ($e)');
+    }
+    try {
+      final raw = await _persistence.load(WhisperrPersistence.identifySentSlot);
+      if (raw != null && raw.isNotEmpty) {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map &&
+            decoded['user_id'] is String &&
+            decoded['traits'] is Map &&
+            decoded['at'] is String) {
+          final at = DateTime.tryParse(decoded['at'] as String);
+          if (at != null) {
+            _identifySent = (
+              user: decoded['user_id'] as String,
+              traits: Map<String, dynamic>.from(decoded['traits'] as Map),
+              at: at.toUtc(),
+            );
+          }
+        }
+      }
+    } catch (e) {
+      _log('failed to restore identify record ($e)');
     }
     if (_optedOut) {
       // Keep only push opt-outs: a queue write may have raced optOut(), and
@@ -1336,16 +1900,19 @@ class WhisperrClient {
   Future<void> _persistPushState() async {
     try {
       final uid = _lastPushUserId;
+      final anon = _lastPushAnonymousId;
       final token = _lastPushToken;
-      if (uid == null || token == null) {
+      final sentAt = _lastPushSentAt;
+      if ((uid == null && anon == null) || token == null) {
         await _persistence.clear(WhisperrPersistence.pushSlot);
       } else {
         await _persistence.save(
             WhisperrPersistence.pushSlot,
             jsonEncode({
-              'user_id': uid,
+              if (uid != null) 'user_id': uid else 'anonymous_id': anon,
               'token': token,
               if (_lastPushMeta != null) 'meta': _lastPushMeta,
+              if (sentAt != null) 'sent_at': sentAt.toUtc().toIso8601String(),
             }));
       }
     } catch (e) {
@@ -1486,8 +2053,9 @@ class Whisperr {
 }
 
 /// [op] cut down to its push opt-outs (a rotation, a denied permission, an
-/// earlier opt-out), marked to go out while opted out; null when it retires
-/// no token.
+/// earlier opt-out), under the same subject (user, or anonymous handle for
+/// an anonymous identify), marked to go out while opted out; null when it
+/// retires no token.
 WhisperrQueueOp? _pushRetirements(WhisperrQueueOp op) {
   final channels = op.body['channels'];
   if (op.kind != WhisperrOpKind.identify || channels is! List) return null;
@@ -1496,10 +2064,17 @@ WhisperrQueueOp? _pushRetirements(WhisperrQueueOp op) {
       if (c is Map && c['channel'] == 'push' && c['opted_in'] == false) c,
   ];
   if (retired.isEmpty) return null;
+  final user = op.body['external_user_id'];
   return WhisperrQueueOp(
     id: op.id,
     kind: WhisperrOpKind.identify,
     optOut: true,
-    body: {'external_user_id': op.body['external_user_id'], 'channels': retired},
+    body: {
+      if (user != null)
+        'external_user_id': user
+      else
+        'anonymous_id': op.body['anonymous_id'],
+      'channels': retired,
+    },
   );
 }

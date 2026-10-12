@@ -158,6 +158,8 @@ class WhisperrChannel {
     this.kind,
     this.platform,
     this.pushEnv,
+    this.clientAppId,
+    this.providerProject,
   });
 
   /// Convenience constructor for an email channel.
@@ -178,14 +180,17 @@ class WhisperrChannel {
           verified: verified,
           optedIn: optedIn);
 
-  /// Convenience constructor for a push token channel. [kind], [platform]
-  /// and [pushEnv] are optional token metadata; send only what you know.
+  /// Convenience constructor for a push token channel. [kind], [platform],
+  /// [pushEnv], [clientAppId] and [providerProject] are optional token
+  /// metadata; send only what you know.
   factory WhisperrChannel.push(String address,
           {bool? verified,
           bool? optedIn,
           WhisperrPushTokenKind? kind,
           String? platform,
-          WhisperrPushEnvironment? pushEnv}) =>
+          WhisperrPushEnvironment? pushEnv,
+          String? clientAppId,
+          String? providerProject}) =>
       WhisperrChannel(
           type: WhisperrChannelType.push,
           address: address,
@@ -193,7 +198,9 @@ class WhisperrChannel {
           optedIn: optedIn,
           kind: kind,
           platform: platform,
-          pushEnv: pushEnv);
+          pushEnv: pushEnv,
+          clientAppId: clientAppId,
+          providerProject: providerProject);
 
   final WhisperrChannelType type;
   final String address;
@@ -209,11 +216,21 @@ class WhisperrChannel {
   /// Push only: the APNs environment, sent as `push_env`.
   final WhisperrPushEnvironment? pushEnv;
 
+  /// Push only: the app that made the token, sent as `client_app_id`: the
+  /// iOS bundle id or the Android package name.
+  final String? clientAppId;
+
+  /// Push only: the provider project the token belongs to, sent as
+  /// `provider_project`: the Firebase project id for an FCM token.
+  final String? providerProject;
+
   Map<String, dynamic> toJson() {
     // Token metadata goes only on an opted-in push entry; an opt-out is
     // matched by address alone.
     final meta = type == WhisperrChannelType.push && optedIn != false;
     final os = platform?.trim();
+    final appId = clientAppId?.trim();
+    final project = providerProject?.trim();
     return {
       'channel': type.wireValue,
       'address': address,
@@ -222,6 +239,9 @@ class WhisperrChannel {
       if (meta && kind != null) 'kind': kind!.wireValue,
       if (meta && os != null && os.isNotEmpty) 'platform': os,
       if (meta && pushEnv != null) 'push_env': pushEnv!.wireValue,
+      if (meta && appId != null && appId.isNotEmpty) 'client_app_id': appId,
+      if (meta && project != null && project.isNotEmpty)
+        'provider_project': project,
     };
   }
 }
@@ -254,6 +274,8 @@ class WhisperrQueueOp {
     required this.kind,
     required this.body,
     this.optOut = false,
+    this.restoreTraits,
+    this.restoreMerge = false,
   });
 
   factory WhisperrQueueOp.fromJson(Map<String, dynamic> json) =>
@@ -262,6 +284,10 @@ class WhisperrQueueOp {
         kind: WhisperrOpKind.values.byName(json['kind'] as String),
         body: Map<String, dynamic>.from(json['body'] as Map),
         optOut: json['opt_out'] == true,
+        restoreTraits: json['restore_traits'] is Map
+            ? Map<String, dynamic>.from(json['restore_traits'] as Map)
+            : null,
+        restoreMerge: json['restore_merge'] == true,
       );
 
   final String id;
@@ -272,10 +298,22 @@ class WhisperrQueueOp {
   /// delivered while the device is opted out.
   final bool optOut;
 
+  /// Identify only: the restore traits (device defaults, `app_language`) as
+  /// this identify delivers them. After a 2xx the client stores them with the
+  /// user and the time, so the next launch can skip a redundant restore
+  /// identify.
+  final Map<String, dynamic>? restoreTraits;
+
+  /// Whether [restoreTraits] update the stored record (a partial identify)
+  /// instead of replacing it.
+  final bool restoreMerge;
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'kind': kind.name,
         'body': body,
         if (optOut) 'opt_out': true,
+        if (restoreTraits != null) 'restore_traits': restoreTraits,
+        if (restoreMerge) 'restore_merge': true,
       };
 }

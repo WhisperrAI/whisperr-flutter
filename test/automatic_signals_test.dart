@@ -301,9 +301,38 @@ void main() {
         ..._context,
         'whisperr_message_id': 'msg_1',
         'deep_link': 'app://offers',
+        'action_id': 'default',
       });
-      expect(
-          _props(h.events[1]), {..._context, 'whisperr_message_id': 'msg_2'});
+      expect(_props(h.events[1]), {
+        ..._context,
+        'whisperr_message_id': 'msg_2',
+        'action_id': 'default',
+      });
+    });
+
+    test('sends action_id and cold_start when the caller knows them',
+        () async {
+      final h = _Harness();
+      final client = h.client(automatic: false);
+      await client.start();
+      await client.trackPushOpened({'whisperr_message_id': 'msg_1'},
+          actionId: 'renew', coldStart: true);
+      await client.trackPushOpened({'whisperr_message_id': 'msg_2'},
+          actionId: '  ', coldStart: false);
+      await client.flush();
+      await client.close();
+      expect(_props(h.events[0]), {
+        ..._context,
+        'whisperr_message_id': 'msg_1',
+        'action_id': 'renew',
+        'cold_start': true,
+      });
+      expect(_props(h.events[1]), {
+        ..._context,
+        'whisperr_message_id': 'msg_2',
+        'action_id': 'default',
+        'cold_start': false,
+      });
     });
 
     test('dedupe survives a restart (cold start re-delivers the tap)',
@@ -320,6 +349,58 @@ void main() {
       expect(await second.trackPushOpened({'whisperr_message_id': 'msg_1'}),
           isFalse);
       await second.close();
+    });
+  });
+
+  group('trackPushReceived', () {
+    test('sends push_received once per whisperr_message_id, also after a restart',
+        () async {
+      final h = _Harness();
+      final first = h.client();
+      await first.start();
+      expect(await first.trackPushReceived({'whisperr_message_id': 'msg_1'}),
+          isTrue);
+      expect(await first.trackPushReceived({'whisperr_message_id': 'msg_1'}),
+          isFalse);
+      expect(await first.trackPushReceived({'title': 'not ours'}), isFalse);
+      await first.close();
+
+      final second = h.client();
+      await second.start();
+      expect(await second.trackPushReceived({'whisperr_message_id': 'msg_1'}),
+          isFalse);
+      // A receipt does not block the open of the same message.
+      expect(await second.trackPushOpened({'whisperr_message_id': 'msg_1'}),
+          isTrue);
+      await second.close();
+
+      final push = h.events
+          .where((e) => (e['event_type'] as String).startsWith('push_'))
+          .toList();
+      expect(push.map((e) => e['event_type']), ['push_received', 'push_opened']);
+      expect(_props(push[0]), {
+        ..._context,
+        'whisperr_message_id': 'msg_1',
+        'foreground': true,
+        'source': 'foreground',
+      });
+    });
+
+    test('the automatic-events switch and opt-out stop it', () async {
+      final h = _Harness();
+      final off = h.client(automatic: false);
+      await off.start();
+      expect(await off.trackPushReceived({'whisperr_message_id': 'm1'}),
+          isFalse);
+      await off.close();
+
+      final optedOut = h.client();
+      await optedOut.start();
+      await optedOut.optOut();
+      expect(await optedOut.trackPushReceived({'whisperr_message_id': 'm2'}),
+          isFalse);
+      await optedOut.close();
+      expect(h.eventTypes, isNot(contains('push_received')));
     });
   });
 
