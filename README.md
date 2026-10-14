@@ -11,7 +11,7 @@ dependencies:
 
 ## Initialize
 
-Call once at startup (e.g. in `main`). Get an **app ingestion key** from the Whisperr dashboard → **Developer → API Keys**.
+Call once at startup (e.g. in `main`). Get an **app ingestion key** from the Whisperr dashboard → **Settings → API keys**.
 
 ```dart
 import 'package:whisperr/whisperr.dart';
