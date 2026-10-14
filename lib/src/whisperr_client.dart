@@ -2014,7 +2014,7 @@ class Whisperr {
   static bool get isInitialized => _instance != null;
 
   /// Initializes the singleton. [apiKey] is an app ingestion key from the
-  /// Whisperr dashboard (Developer → API Keys). [baseUrl] defaults to the
+  /// Whisperr dashboard (Settings → API keys). [baseUrl] defaults to the
   /// hosted Whisperr API ([kWhisperrDefaultBaseUrl]); override it only for
   /// self-hosted or local development backends.
   static Future<void> initialize({
