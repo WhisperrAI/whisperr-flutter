@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -243,6 +244,122 @@ void main() {
     await client.flush();
 
     expect(client.pendingCount, 0);
+  });
+
+  group('rejected requests warn without debug', () {
+    Future<List<String>> capturePrints(Future<void> Function() body) async {
+      final prints = <String>[];
+      final original = debugPrint;
+      debugPrint = (String? message, {int? wrapWidth}) {
+        if (message != null) prints.add(message);
+      };
+      try {
+        await body();
+      } finally {
+        debugPrint = original;
+      }
+      return prints;
+    }
+
+    String warning(int status) =>
+        '[whisperr] dropped a request: the server rejected it with $status. '
+        'Later rejections with this status are reported through onError, '
+        'or here with debug on.';
+
+    test('once per status code, and every drop reaches onError', () async {
+      var status = 400;
+      final errors = <WhisperrError>[];
+      final client = buildClient(
+        MockClient((_) async => http.Response(
+            '{"error":{"code":"invalid_request","message":"bad"}}', status)),
+        options: WhisperrOptions(
+          flushOnLifecyclePause: false,
+          trackAutomaticEvents: false,
+          retryBaseDelay: const Duration(milliseconds: 1),
+          maxRetryDelay: const Duration(milliseconds: 5),
+          maxRetries: 2,
+          onError: errors.add,
+        ),
+      );
+      addTearDown(client.close);
+      await client.start();
+
+      final prints = await capturePrints(() async {
+        await client.track('first_event', userId: 'u1');
+        await client.flush();
+        await client.track('second_event', userId: 'u1');
+        await client.flush();
+        status = 422;
+        await client.track('third_event', userId: 'u1');
+        await client.flush();
+      });
+
+      expect(prints.where((m) => m.contains('rejected')),
+          [warning(400), warning(422)]);
+      expect(
+        errors.where((e) => e.type == 'dropped').map((e) => e.status),
+        [400, 400, 422],
+      );
+      expect(client.pendingCount, 0);
+    });
+
+    test('with debug on, every drop is logged', () async {
+      final client = buildClient(
+        MockClient((_) async => http.Response(
+            '{"error":{"code":"invalid_request","message":"bad"}}', 400)),
+        options: const WhisperrOptions(
+          flushOnLifecyclePause: false,
+          trackAutomaticEvents: false,
+          debug: true,
+        ),
+      );
+      addTearDown(client.close);
+      await client.start();
+
+      final prints = await capturePrints(() async {
+        await client.track('first_event', userId: 'u1');
+        await client.flush();
+        await client.track('second_event', userId: 'u1');
+        await client.flush();
+      });
+
+      expect(prints.where((m) => m.contains('dropping op')), hasLength(2));
+      expect(prints.where((m) => m.startsWith('[whisperr] dropped a request')),
+          isEmpty);
+    });
+
+    for (final status in [429, 503]) {
+      test('a $status is kept for retry without a drop warning', () async {
+        var code = status;
+        final errors = <WhisperrError>[];
+        final client = buildClient(
+          MockClient((_) async => http.Response('{}', code)),
+          options: WhisperrOptions(
+            flushOnLifecyclePause: false,
+            trackAutomaticEvents: false,
+            retryBaseDelay: const Duration(milliseconds: 1),
+            maxRetryDelay: const Duration(milliseconds: 5),
+            maxRetries: 0,
+            onError: errors.add,
+          ),
+        );
+        addTearDown(client.close);
+        await client.start();
+
+        final prints = await capturePrints(() async {
+          await client.track('feature_used', userId: 'u1');
+          await client.flush();
+        });
+
+        expect(prints.where((m) => m.contains('rejected')), isEmpty);
+        expect(errors.where((e) => e.type == 'dropped'), isEmpty);
+        expect(client.pendingCount, 1);
+
+        code = 202;
+        await client.flush();
+        expect(client.pendingCount, 0);
+      });
+    }
   });
 
   test('an auth error pauses delivery and keeps the queue', () async {

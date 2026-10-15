@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Rejected requests warn without debug.** When the server rejects a request
+  with a non-retryable `4xx` (not `401`, `403` or `429`), the SDK drops it, as
+  before, and now logs a `debugPrint` warning the first time each status code
+  occurs, even with `debug` off. The message names only the status code. Every
+  drop still reaches `onError`; with `debug` on, every drop is logged as
+  before. `429` and `5xx` keep retrying.
+
 ## 0.6.0
 
 Contract v2 (whisperr-spec SPEC.md "Contract v2"). The server must accept
