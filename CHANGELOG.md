@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.1
 
 - **Rejected requests warn without debug.** When the server rejects a request
   with a non-retryable `4xx` (not `401`, `403` or `429`), the SDK drops it, as
