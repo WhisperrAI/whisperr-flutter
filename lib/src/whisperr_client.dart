@@ -163,6 +163,9 @@ class WhisperrClient {
   bool _closed = false;
   int _seq = 0;
 
+  /// Status codes whose drop was already logged with debug off.
+  final Set<int> _warnedDropStatuses = {};
+
   /// The most recently identified user id, if any. Restored from persistence
   /// on [start], so it survives app restarts.
   String? get currentUserId => _currentUserId;
@@ -1628,6 +1631,7 @@ class WhisperrClient {
           _emit('dropped', 'dropped op after permanent client error',
               status: e.statusCode);
           _log('dropping op after permanent client error ($e)');
+          _warnDropped(e.statusCode!);
           // Overflow may already have evicted this request and cleared its
           // push mark. Do not clear a newer registration's mark a second time.
           // The push opt-outs that optOut() cut from this request share its
@@ -1977,6 +1981,16 @@ class WhisperrClient {
 
   void _log(String message) {
     if (_options.debug) debugPrint('[whisperr] $message');
+  }
+
+  /// A dropped request is gone for good, so say so even with debug off: once
+  /// per status code per client, so a misconfigured app does not flood the
+  /// log. With debug on, [_log] already reports every drop.
+  void _warnDropped(int status) {
+    if (_options.debug || !_warnedDropStatuses.add(status)) return;
+    debugPrint('[whisperr] dropped a request: the server rejected it with '
+        '$status. Later rejections with this status are reported through '
+        'onError, or here with debug on.');
   }
 
   void _emit(String type, String message, {int? status}) {

@@ -304,7 +304,7 @@ await Whisperr.instance.optIn();  // sends again
 
 - **Durable queue** — `identify` and `track` are appended to an ordered queue and delivered in order. `identify` calls hit `POST /v1/identify`; `track` calls are coalesced into `POST /v1/events/batch`.
 - **Batching** — flushes on an interval (`flushInterval`), when the buffer hits `flushAt`, when the app goes to the background (hidden/pause/detach), or when you call `flush()`.
-- **Offline** — the queue is persisted (via `shared_preferences`) and survives app restarts. Transient failures (network, 429, 5xx) retry with exponential backoff; a `Retry-After` on 429/503 replaces the backoff (capped at 60 s); auth errors (401/403) pause delivery and keep the queue; permanent client errors (4xx) drop the offending item so the queue keeps moving.
+- **Offline** — the queue is persisted (via `shared_preferences`) and survives app restarts. Transient failures (network, 429, 5xx) retry with exponential backoff; a `Retry-After` on 429/503 replaces the backoff (capped at 60 s); auth errors (401/403) pause delivery and keep the queue; permanent client errors (4xx) drop the offending item so the queue keeps moving. Every drop reaches `onError`; the first drop for each status code also logs a `debugPrint` warning, even with `debug` off.
 
 ## Options
 
