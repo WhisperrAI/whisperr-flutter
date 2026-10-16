@@ -50,7 +50,7 @@ await Whisperr.instance.identify(
 
 ### Email consent
 
-The `email` shortcut stores the address and claims no consent. Pass `emailOptedIn` with your user's answer when you have it: it is sent as `opted_in` on the email channel, and omitting it sends nothing. Whether the address then gets messages depends on your app's answer to "Does your signup get permission to email users?" in Whisperr:
+The `email` shortcut stores the address and claims no consent. Pass `emailOptedIn` (0.7.0 or later) with your user's answer when you have it: it is sent as `opted_in` on the email channel, and omitting it sends nothing. Whether the address then gets messages depends on your app's answer to "Does your signup get permission to email users?" in Whisperr:
 
 - **Yes:** the address is opted in unless you pass `emailOptedIn: false`.
 - **Per user:** only `emailOptedIn: true` opts it in.
