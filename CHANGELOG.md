@@ -10,7 +10,6 @@
   on its own. Without `emailOptedIn` it sends no `opted_in`. Versions before
   0.7.0 send `opted_in: true` on every email shortcut. Push and phone are
   unchanged.
-
 - An email channel with `opted_in: true` also sends `consent_source: "user"`.
   The server needs it to grant consent in "Per user" mode, which tells this
   apart from the `true` that older versions sent by default.
