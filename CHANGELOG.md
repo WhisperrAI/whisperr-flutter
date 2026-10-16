@@ -1,13 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (unreleased)
 
 - **`emailOptedIn` on `identify()`.** Your user's email consent, sent as
   `opted_in` on the `email` shortcut. Whether it opts the address in depends
   on the app's answer to "Does your signup get permission to email users?" in
   Whisperr.
 - **Behavior change:** the `email` shortcut no longer sends `opted_in: true`
-  on its own. Without `emailOptedIn` it sends no `opted_in`.
+  on its own. Without `emailOptedIn` it sends no `opted_in`. Versions before
+  0.7.0 send `opted_in: true` on every email shortcut. Push and phone are
+  unchanged.
 
 ## 0.6.1
 

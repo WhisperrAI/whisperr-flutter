@@ -13,7 +13,7 @@ import 'persistence.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.6.1';
+const String kWhisperrSdkVersion = '0.7.0';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
