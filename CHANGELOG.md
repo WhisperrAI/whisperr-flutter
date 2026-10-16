@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **`emailOptedIn` on `identify()`.** Your user's email consent, sent as
+  `opted_in` on the `email` shortcut. Whether it opts the address in depends
+  on the app's answer to "Does your signup get permission to email users?" in
+  Whisperr.
+- **Behavior change:** the `email` shortcut no longer sends `opted_in: true`
+  on its own. Without `emailOptedIn` it sends no `opted_in`.
+
 ## 0.6.1
 
 - **Rejected requests warn without debug.** When the server rejects a request

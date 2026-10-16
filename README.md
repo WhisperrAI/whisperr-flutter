@@ -26,10 +26,11 @@ await Whisperr.initialize(apiKey: 'wpk_xxx');
 Set who the current user is. Call it after login or sign-up **and on session restore at app start**. It is idempotent. Traits are merged server-side; channels are how Whisperr can reach the user (and whether it's allowed to).
 
 ```dart
-// Common case — email/phone/pushToken expand into opted-in channels:
+// Common case — email/phone/pushToken expand into channels:
 await Whisperr.instance.identify(
   'user_123',
   email: 'ada@example.com',
+  emailOptedIn: true, // your user agreed to email; see "Email consent" below
   phone: '+15551234567',
   pushToken: fcmToken, // expands to an opted-in push channel
   traits: {'name': 'Ada', 'plan': 'pro'},
@@ -46,6 +47,16 @@ await Whisperr.instance.identify(
 ```
 
 > Whisperr decides which channel to actually use based on engagement — there's no "preferred channel" to set. Express an explicit user choice via `optedIn: false` on the channels they don't want.
+
+### Email consent
+
+The `email` shortcut stores the address and claims no consent. Pass `emailOptedIn` with your user's answer when you have it: it is sent as `opted_in` on the email channel, and omitting it sends nothing. Whether the address then gets messages depends on your app's answer to "Does your signup get permission to email users?" in Whisperr:
+
+- **Yes:** the address is opted in unless you pass `emailOptedIn: false`.
+- **Per user:** only `emailOptedIn: true` opts it in.
+- **No:** the address gets no messages until your server confirms it.
+
+If your app requires a server key for email (the stricter mode), only your backend can opt an address in, with the server key. Never put the server key in your app.
 
 ### Restore at start
 

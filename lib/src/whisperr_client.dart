@@ -269,8 +269,20 @@ class WhisperrClient {
   /// carries it so the server merges those events into this user.
   ///
   /// Pass [email] / [phone] / [pushToken] for the common case; they expand into
-  /// opted-in channels with no `verified` field (the server decides). For
-  /// consent or verification control (opt-out, verified flags, multiple
+  /// channels with no `verified` field (the server decides). [phone] and
+  /// [pushToken] expand into opted-in channels.
+  ///
+  /// [email] claims no consent by itself. Pass [emailOptedIn] with your
+  /// user's answer: it is sent as `opted_in` on the email channel (omitted:
+  /// no `opted_in`). Whether the address then gets messages depends on the
+  /// app's answer to "Does your signup get permission to email users?" in
+  /// Whisperr: with "Yes" it is opted in unless [emailOptedIn] is false; with
+  /// "Per user" only `emailOptedIn: true` opts it in; with "No" it gets no
+  /// messages until your server confirms it. If the app requires a server key
+  /// for email (the stricter mode), only your server can opt it in.
+  /// [emailOptedIn] is ignored without [email].
+  ///
+  /// For consent or verification control (opt-out, verified flags, multiple
   /// addresses) build [channels] explicitly. Whisperr decides
   /// which channel to actually use, so there is no "preferred channel" to set.
   ///
@@ -295,6 +307,7 @@ class WhisperrClient {
     String externalUserId, {
     Map<String, dynamic>? traits,
     String? email,
+    bool? emailOptedIn,
     String? phone,
     String? pushToken,
     String? preferredChannel,
@@ -305,6 +318,7 @@ class WhisperrClient {
     return _mutateIdentity(() => _identify(externalUserId,
         traits: traits,
         email: email,
+        emailOptedIn: emailOptedIn,
         phone: phone,
         pushToken: pushToken,
         preferredChannel: preferredChannel,
@@ -316,6 +330,7 @@ class WhisperrClient {
     String externalUserId, {
     Map<String, dynamic>? traits,
     String? email,
+    bool? emailOptedIn,
     String? phone,
     String? pushToken,
     String? preferredChannel,
@@ -342,7 +357,7 @@ class WhisperrClient {
 
     final resolved = <WhisperrChannel>[
       if (email != null && email.trim().isNotEmpty)
-        WhisperrChannel.email(email.trim(), optedIn: true),
+        WhisperrChannel.email(email.trim(), optedIn: emailOptedIn),
       if (phone != null && phone.trim().isNotEmpty)
         WhisperrChannel.sms(phone.trim(), optedIn: true),
       if (pushToken != null && pushToken.trim().isNotEmpty)
