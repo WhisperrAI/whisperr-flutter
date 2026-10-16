@@ -6,7 +6,7 @@ Identify your users and track product events so Whisperr can decide and deliver 
 
 ```yaml
 dependencies:
-  whisperr: ^0.6.0
+  whisperr: ^0.7.0
 ```
 
 ## Initialize
@@ -30,7 +30,8 @@ Set who the current user is. Call it after login or sign-up **and on session res
 await Whisperr.instance.identify(
   'user_123',
   email: 'ada@example.com',
-  emailOptedIn: true, // your user agreed to email; see "Email consent" below
+  // Only when your user agreed to email (see "Email consent" below):
+  // emailOptedIn: true,
   phone: '+15551234567',
   pushToken: fcmToken, // expands to an opted-in push channel
   traits: {'name': 'Ada', 'plan': 'pro'},
@@ -55,6 +56,8 @@ The `email` shortcut stores the address and claims no consent. Pass `emailOptedI
 - **Yes:** the address is opted in unless you pass `emailOptedIn: false`.
 - **Per user:** only `emailOptedIn: true` opts it in.
 - **No:** the address gets no messages until your server confirms it.
+
+An earlier opt-out, including the unsubscribe link, is kept: a later identify from the app never opts the address back in. An address that another user in the app already holds stays pending. A new address can also stay pending when the app has reached its hourly limit of new email addresses from the app.
 
 If your app requires a server key for email (the stricter mode), only your backend can opt an address in, with the server key. Never put the server key in your app.
 

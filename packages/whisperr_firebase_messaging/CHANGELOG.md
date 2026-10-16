@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 (unreleased)
+
+- Works with `whisperr` 0.7.0: the dependency is now `>=0.6.0 <0.8.0`.
+
 ## 0.1.0
 
 First release. Needs `whisperr` 0.6.0.

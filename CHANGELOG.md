@@ -13,6 +13,10 @@
 - An email channel with `opted_in: true` also sends `consent_source: "user"`.
   The server needs it to grant consent in "Per user" mode, which tells this
   apart from the `true` that older versions sent by default.
+- An identify from the app no longer opts an address back in after the user
+  opted out of it (including through the unsubscribe link). This rule is
+  enforced by the Whisperr backend, which also has to accept
+  `consent_source` before this version ships.
 
 ## 0.6.1
 
