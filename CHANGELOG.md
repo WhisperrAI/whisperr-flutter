@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0 (unreleased)
+
+- **`emailOptedIn` on `identify()`.** Your user's email consent, sent as
+  `opted_in` on the `email` shortcut. Whether it opts the address in depends
+  on the app's answer to "Does your signup get permission to email users?" in
+  Whisperr.
+- **Behavior change:** the `email` shortcut no longer sends `opted_in: true`
+  on its own. Without `emailOptedIn` it sends no `opted_in`. Versions before
+  0.7.0 send `opted_in: true` on every email shortcut. Push and phone are
+  unchanged.
+- An email channel with `opted_in: true` also sends `consent_source: "user"`.
+  The server needs it to grant consent in "Per user" mode, which tells this
+  apart from the `true` that older versions sent by default.
+- An identify from the app no longer opts an address back in after the user
+  opted out of it (including through the unsubscribe link). This rule is
+  enforced by the Whisperr backend, which also has to accept
+  `consent_source` before this version ships.
+
 ## 0.6.1
 
 - **Rejected requests warn without debug.** When the server rejects a request

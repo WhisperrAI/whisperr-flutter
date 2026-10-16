@@ -78,6 +78,7 @@ Future<void> _applyCase(WhisperrClient client, Map<String, dynamic> c) async {
     s['externalUserId'] as String,
     traits: (s['traits'] as Map<String, dynamic>?),
     email: s['email'] as String?,
+    emailOptedIn: s['emailOptedIn'] as bool?,
     phone: s['phone'] as String?,
     pushToken: s['pushToken'] as String?,
     preferredChannel: s['preferredChannel'] as String?,
@@ -131,10 +132,41 @@ void main() {
               reason: '${c['name']}.occurred_at');
         }
       } else {
-        (c['expectedBody'] as Map<String, dynamic>? ?? {}).forEach((k, v) {
+        final expected = _withKnownDivergences(
+            c, c['expectedBody'] as Map<String, dynamic>? ?? {});
+        expected.forEach((k, v) {
           expect(body[k], v, reason: '${c['name']}.$k');
         });
       }
     }
   });
+}
+
+/// Deliberate, documented departure from the spec fixture while the spec
+/// catches up (contract C1, client email consent): the `email` shortcut claims
+/// no consent on the user's behalf, so without `emailOptedIn` the SDK leaves
+/// `opted_in` off the email channel instead of sending `true`. Idempotent, so
+/// this stays correct once the fixture drops `opted_in` itself.
+Map<String, dynamic> _withKnownDivergences(
+    Map<String, dynamic> c, Map<String, dynamic> expected) {
+  final scenario = c['scenario'] as Map<String, dynamic>;
+  if (c['name'] != 'identify_email_shortcut' ||
+      scenario.containsKey('emailOptedIn')) {
+    return expected;
+  }
+  final channels = expected['channels'];
+  if (channels is! List) return expected;
+  return {
+    ...expected,
+    'channels': [
+      for (final raw in channels)
+        if (raw is Map && raw['channel'] == 'email')
+          {
+            for (final e in raw.entries)
+              if (e.key != 'opted_in') e.key as String: e.value
+          }
+        else
+          raw
+    ],
+  };
 }

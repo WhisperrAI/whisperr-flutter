@@ -538,7 +538,7 @@ void main() {
   });
 
   group('channels', () {
-    test('the email shortcut sends no verified field', () async {
+    test('the email shortcut sends no verified or opted_in field', () async {
       final h = _Harness();
       final client = h.client(automatic: false);
       await client.start();
@@ -548,7 +548,7 @@ void main() {
 
       final channels = h.identifies.single['channels'] as List;
       expect(channels.single,
-          {'channel': 'email', 'address': 'ada@example.com', 'opted_in': true});
+          {'channel': 'email', 'address': 'ada@example.com'});
     });
   });
 

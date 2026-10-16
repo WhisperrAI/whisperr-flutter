@@ -89,7 +89,8 @@ void main() {
     expect(client.currentUserId, 'u1');
   });
 
-  test('email/phone shortcuts expand into opted-in channels', () async {
+  test('email/phone shortcuts: email claims no consent, phone is opted in',
+      () async {
     final requests = <http.Request>[];
     final mock = MockClient((req) async {
       requests.add(req);
@@ -107,11 +108,66 @@ void main() {
     final body = jsonDecode(requests.first.body) as Map<String, dynamic>;
     final channels = (body['channels'] as List).cast<Map<String, dynamic>>();
     expect(channels, hasLength(2));
-    expect(channels[0],
-        {'channel': 'email', 'address': 'ada@example.com', 'opted_in': true});
+    expect(channels[0], {'channel': 'email', 'address': 'ada@example.com'});
     expect(channels[1],
         {'channel': 'sms', 'address': '+15551234567', 'opted_in': true});
     expect(body.containsKey('preferred_channel'), isFalse);
+  });
+
+  for (final optedIn in [true, false]) {
+    test('emailOptedIn: $optedIn is sent as opted_in on the email shortcut',
+        () async {
+      final requests = <http.Request>[];
+      final mock = MockClient((req) async {
+        requests.add(req);
+        return http.Response(
+            '{"user":{"id":"usr_1","external_id":"u1","created":true}}', 200);
+      });
+      final client = buildClient(mock);
+      addTearDown(client.close);
+      await client.start();
+
+      await client.identify('u1',
+          email: 'ada@example.com', emailOptedIn: optedIn);
+      await client.flush();
+
+      final body = jsonDecode(requests.first.body) as Map<String, dynamic>;
+      expect(body['channels'], [
+        {
+          'channel': 'email',
+          'address': 'ada@example.com',
+          'opted_in': optedIn,
+          if (optedIn) 'consent_source': 'user',
+        }
+      ]);
+    });
+  }
+
+  test('only an opted-in email channel carries consent_source', () {
+    expect(WhisperrChannel.email('a@b.co', optedIn: true).toJson(),
+        {'channel': 'email', 'address': 'a@b.co', 'opted_in': true, 'consent_source': 'user'});
+    expect(WhisperrChannel.email('a@b.co').toJson(),
+        {'channel': 'email', 'address': 'a@b.co'});
+    expect(WhisperrChannel.sms('+15551234567', optedIn: true).toJson(),
+        {'channel': 'sms', 'address': '+15551234567', 'opted_in': true});
+  });
+
+  test('emailOptedIn without an email sends no channel', () async {
+    final requests = <http.Request>[];
+    final mock = MockClient((req) async {
+      requests.add(req);
+      return http.Response(
+          '{"user":{"id":"usr_1","external_id":"u1","created":true}}', 200);
+    });
+    final client = buildClient(mock);
+    addTearDown(client.close);
+    await client.start();
+
+    await client.identify('u1', emailOptedIn: true);
+    await client.flush();
+
+    final body = jsonDecode(requests.first.body) as Map<String, dynamic>;
+    expect(body.containsKey('channels'), isFalse);
   });
 
   test('track buffers events and flushes them as a single batch', () async {
