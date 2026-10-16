@@ -133,10 +133,24 @@ void main() {
 
       final body = jsonDecode(requests.first.body) as Map<String, dynamic>;
       expect(body['channels'], [
-        {'channel': 'email', 'address': 'ada@example.com', 'opted_in': optedIn}
+        {
+          'channel': 'email',
+          'address': 'ada@example.com',
+          'opted_in': optedIn,
+          if (optedIn) 'consent_source': 'user',
+        }
       ]);
     });
   }
+
+  test('only an opted-in email channel carries consent_source', () {
+    expect(WhisperrChannel.email('a@b.co', optedIn: true).toJson(),
+        {'channel': 'email', 'address': 'a@b.co', 'opted_in': true, 'consent_source': 'user'});
+    expect(WhisperrChannel.email('a@b.co').toJson(),
+        {'channel': 'email', 'address': 'a@b.co'});
+    expect(WhisperrChannel.sms('+15551234567', optedIn: true).toJson(),
+        {'channel': 'sms', 'address': '+15551234567', 'opted_in': true});
+  });
 
   test('emailOptedIn without an email sends no channel', () async {
     final requests = <http.Request>[];

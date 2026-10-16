@@ -236,6 +236,10 @@ class WhisperrChannel {
       'address': address,
       if (verified != null) 'verified': verified,
       if (optedIn != null) 'opted_in': optedIn,
+      // The app's own consent answer, not an old SDK's default `true`
+      // (contract C1, "Per user" mode).
+      if (type == WhisperrChannelType.email && optedIn == true)
+        'consent_source': 'user',
       if (meta && kind != null) 'kind': kind!.wireValue,
       if (meta && os != null && os.isNotEmpty) 'platform': os,
       if (meta && pushEnv != null) 'push_env': pushEnv!.wireValue,
