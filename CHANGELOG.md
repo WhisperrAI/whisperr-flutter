@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 (unreleased)
+## 0.7.0
 
 - **`emailOptedIn` on `identify()`.** Your user's email consent, sent as
   `opted_in` on the `email` shortcut. Whether it opts the address in depends
