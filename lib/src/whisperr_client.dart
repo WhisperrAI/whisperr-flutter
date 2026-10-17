@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:ui' show PlatformDispatcher;
 
+import 'package:flutter/foundation.dart' show FlutterExceptionHandler, kDebugMode;
 import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
 

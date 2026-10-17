@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:ui' show PlatformDispatcher;
 
+import 'package:flutter/foundation.dart' show FlutterExceptionHandler;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -73,7 +74,7 @@ void main() {
       final vectors =
           (spec['signalsV3'] as Map)['fingerprintVectors'] as List;
       expect(vectors, isNotEmpty);
-      for (final v in vectors.cast<Map>()) {
+      for (final v in vectors.cast<Map<String, dynamic>>()) {
         expect(
             errorFingerprint(v['errorName'] as String,
                 (v['frames'] as List).cast<String>()),

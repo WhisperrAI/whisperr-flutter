@@ -275,7 +275,7 @@ Object _uncaught(String name) => switch (name) {
 /// signalsV3 legacy rule: drop [legacyStrip.events], and remove the
 /// [legacyStrip.properties] keys the expected event does not name.
 List<Map<String, dynamic>> _legacy(Map<String, dynamic> spec,
-    List<Map<String, dynamic>> sent, List expected) {
+    List<Map<String, dynamic>> sent, List<dynamic> expected) {
   final strip = (spec['signalsV3'] as Map)['legacyStrip'] as Map;
   final events = (strip['events'] as List).cast<String>().toSet();
   final keys = (strip['properties'] as List).cast<String>();
