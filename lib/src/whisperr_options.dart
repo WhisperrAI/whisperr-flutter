@@ -15,6 +15,8 @@ class WhisperrOptions {
     this.flushOnLifecyclePause = true,
     this.trackAutomaticEvents = true,
     this.restoreIdentifyDelay = const Duration(seconds: 3),
+    this.captureErrors = true,
+    this.launchSourceWindow = const Duration(milliseconds: 1500),
     this.debug = false,
     this.onError,
   })  : assert(flushAt > 0),
@@ -73,6 +75,20 @@ class WhisperrOptions {
   /// device. It skips it when it delivered the same traits for the same user
   /// less than 24 hours ago.
   final Duration restoreIdentifyDelay;
+
+  /// Report uncaught Dart and Flutter errors as `app_error` (through
+  /// `FlutterError.onError` and `PlatformDispatcher.instance.onError`, each
+  /// chained to the handler that was there before). An `app_error` carries
+  /// the error's type name and a fingerprint of its top stack frames, never
+  /// its message or stack. Needs [trackAutomaticEvents]. Set to false to stop
+  /// automatic capture; [WhisperrClient.trackError] works either way.
+  final bool captureErrors;
+
+  /// How long `app_opened` waits for its launch source (a push tap, a link
+  /// passed to [WhisperrClient.handleLaunchUri]). It goes out sooner when a
+  /// push tap resolves it, when the app goes to the background, or on
+  /// [WhisperrClient.flush]. [Duration.zero] sends it at once.
+  final Duration launchSourceWindow;
 
   /// Emit verbose logs via `debugPrint`.
   final bool debug;

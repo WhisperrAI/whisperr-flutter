@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.8.0
+
+- **Sessions.** Every event carries `context.session_id` (`sess_` plus a
+  UUID v4): new on each cold start and after 30 minutes without an event.
+- **`app_backgrounded` counters:** `session_id`, `screen_count`,
+  `unique_screen_count`, `event_count`, `error_count`. `foreground_ms` now
+  uses a monotonic clock.
+- **`launch_source` on `app_opened`** (`push`, `deep_link`, `universal_link`,
+  `widget`, `shortcut`, `email`, `direct`). `app_opened` waits up to 1500 ms
+  (`WhisperrOptions.launchSourceWindow`) for a push tap or a link passed to
+  the new `handleLaunchUri()`; `flush()` and going to the background end the
+  wait. Links add `link_route` (path only, ids redacted), `link_host`,
+  `utm_*`; `first_after_update` marks the first open after an update.
+- **`WhisperrNavigatorObserver`** sends `screen_viewed` for named page routes.
+- **`app_error`:** uncaught errors through `FlutterError.onError` and
+  `PlatformDispatcher.instance.onError` (chained; the previous handlers still
+  run), plus `trackError()`. Type name and fingerprint only, never the
+  message or stack. Deduped per fingerprint, at most 20 per session.
+  `WhisperrOptions.captureErrors` (default true) turns automatic capture off.
+- **`app_crashed`** on the next launch when the app ended while in the
+  foreground (unclean-shutdown flag). Never in debug builds.
+
 ## 0.7.0
 
 - **`emailOptedIn` on `identify()`.** Your user's email consent, sent as

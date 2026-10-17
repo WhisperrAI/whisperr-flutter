@@ -55,6 +55,14 @@ abstract class WhisperrPersistence {
   /// Recent `whisperr_message_id`s already reported as `push_received`.
   static const String pushReceivedSlot = 'push_received';
 
+  /// The unclean-shutdown flag: set while the app is in the foreground,
+  /// cleared when it goes to the background. Set at launch: `app_crashed`.
+  static const String runStateSlot = 'run_state';
+
+  /// A fatal error recorded by the error handlers, for the next launch's
+  /// `app_crashed`.
+  static const String lastFatalSlot = 'last_fatal';
+
   Future<String?> load(String slot);
   Future<void> save(String slot, String data);
   Future<void> clear(String slot);

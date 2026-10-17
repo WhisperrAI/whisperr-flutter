@@ -15,6 +15,7 @@ export 'src/models.dart'
         WhisperrPushOpen,
         WhisperrPushPermission,
         WhisperrPushTokenKind;
+export 'src/navigator_observer.dart' show WhisperrNavigatorObserver;
 export 'src/persistence.dart'
     show WhisperrPersistence, InMemoryPersistence, SharedPreferencesPersistence;
 export 'src/whisperr_client.dart'

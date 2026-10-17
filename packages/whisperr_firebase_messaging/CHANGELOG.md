@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0
+
+- Works with `whisperr` 0.8.0: the dependency is now `>=0.6.0 <0.9.0`. With
+  0.8.0, a notification tap that opens the app also sets `launch_source: push`
+  on that launch's `app_opened`.
+
 ## 0.1.1
 
 - Works with `whisperr` 0.7.0: the dependency is now `>=0.6.0 <0.8.0`.

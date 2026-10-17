@@ -6,7 +6,7 @@ Identify your users and track product events so Whisperr can decide and deliver 
 
 ```yaml
 dependencies:
-  whisperr: ^0.7.0
+  whisperr: ^0.8.0
 ```
 
 ## Initialize
@@ -92,6 +92,12 @@ stored value. An invalid tag is ignored. `reset()` keeps it.
 ### Device traits
 
 `identify()` also sends `traits['locale']` (BCP 47, from the platform locale) and `traits['timezone_offset_minutes']` (the device's current UTC offset — Flutter can't obtain an IANA zone name without a plugin) by default; pass your own `traits['timezone']` (an IANA name such as `Europe/Berlin`) or `traits['locale']` to override, and nothing is sent for a value the platform can't provide.
+
+If your app already reads the IANA zone (for example with a timezone plugin), pass it to `identify()`. The SDK adds no dependency for this. A `timezone` you pass replaces the offset fallback:
+
+```dart
+await Whisperr.instance.identify('user_123', traits: {'timezone': 'Europe/Berlin'});
+```
 
 ## Push notifications
 
@@ -266,8 +272,10 @@ The SDK sends these events for you. You write no code.
 | --- | --- | --- |
 | `app_installed` | first launch | `app_version`, `app_build` |
 | `app_updated` | first launch of a new version or build | `app_version`, `app_build`, `previous_version`, `previous_build` |
-| `app_opened` | launch, and each return from background | `cold_start` |
-| `app_backgrounded` | the app leaves the screen | `foreground_ms` |
+| `app_opened` | launch, and each return from background | `cold_start`, `launch_source`, and for a link or push launch `whisperr_message_id`, `link_route`, `link_host`, `utm_source` / `utm_medium` / `utm_campaign` when known; `first_after_update: true` on the first open after an update |
+| `app_backgrounded` | the app leaves the screen | `foreground_ms`, `session_id`, and the counts for that visit: `screen_count`, `unique_screen_count`, `event_count` (your `track()` events), `error_count` |
+| `app_error` | an uncaught Dart or Flutter error, or `trackError()` | `error_kind`, `fatal`, `error_name` (the type name, never the message), `fingerprint`, `screen_name`, `session_id` |
+| `app_crashed` | next launch after the app ended while in the foreground | `crash_kind`, `detected_by`, `crashed_app_version`, `crashed_session_id`, `crashed_screen_name`, `foreground` |
 
 Every SDK-generated event (also `screen_viewed`, `push_opened` and
 `push_received`) carries
@@ -279,12 +287,72 @@ apps get the offset only. A key the platform cannot provide is
 left out (for example `os_version` on Android). Turn the automatic events off
 with `WhisperrOptions(trackAutomaticEvents: false)`.
 
-Screen views are manual. Call `screen()` from your router or a
-`NavigatorObserver`:
+### Sessions
+
+Every event carries `context.session_id` (`sess_` plus a UUID). A new
+session starts on each cold start and after 30 minutes without an event.
+
+### Screens
+
+Add `WhisperrNavigatorObserver` to your navigator. It sends `screen_viewed`
+for each page route, named by its `RouteSettings.name` (unnamed routes,
+dialogs and popups are skipped; pass `nameOf` to name them yourself):
+
+```dart
+MaterialApp(navigatorObservers: [WhisperrNavigatorObserver()]);
+```
+
+With another router, call `screen()` yourself:
 
 ```dart
 Whisperr.instance.screen('Checkout');
 ```
+
+### Launch source
+
+`app_opened` waits up to 1500 ms (`launchSourceWindow`) for what opened the
+app, and sends `launch_source`: `push`, `deep_link`, `universal_link`,
+`widget`, `shortcut`, `email` or `direct`. A push tap reported with
+`trackPushOpened()` (or by `whisperr_firebase_messaging`) makes it `push`.
+Pass links to `handleLaunchUri()`, for example from `app_links`:
+
+```dart
+final links = AppLinks();
+final initial = await links.getInitialLink();
+if (initial != null) Whisperr.instance.handleLaunchUri(initial);
+links.uriLinkStream.listen(Whisperr.instance.handleLaunchUri);
+```
+
+Only the path is sent, as `link_route`, with ids replaced by `:id`. The query
+and the fragment are never sent; `utm_*` are copied when present.
+`wsrc=widget` or `wsrc=shortcut` on the link marks a widget or shortcut
+launch, and `wmid` marks a Whisperr email.
+
+### Errors and crashes
+
+The SDK chains into `FlutterError.onError` and
+`PlatformDispatcher.instance.onError`. Handlers you set before
+`Whisperr.initialize` still run. Each uncaught error is sent as `app_error`
+with its type name and a fingerprint of its top 3 stack frames, never the
+message or the stack. One per fingerprint per session, at most 20 per session.
+Turn automatic capture off with `WhisperrOptions(captureErrors: false)`.
+
+Report a handled error yourself:
+
+```dart
+try {
+  await loadCart();
+} catch (e, st) {
+  Whisperr.instance.trackError(e, stackTrace: st, screen: 'Cart');
+}
+// A name of your own, and a kind (handled, network, screen):
+Whisperr.instance.trackError(response, name: 'HTTP_500', kind: 'network');
+```
+
+When the app ends while it is in the foreground (it never went to the
+background), the next launch sends `app_crashed` before its `app_opened`.
+Debug builds never send it. Flutter keeps running after an uncaught Dart
+error, so these errors are not marked `fatal`.
 
 ## Logout
 
@@ -334,6 +402,8 @@ await Whisperr.initialize(
     enablePersistence: true,
     trackAutomaticEvents: true, // app_installed / updated / opened / backgrounded, push_received
     restoreIdentifyDelay: Duration(seconds: 3), // wait for your own identify() at start
+    captureErrors: true,   // uncaught errors as app_error
+    launchSourceWindow: Duration(milliseconds: 1500), // app_opened waits for its launch source
     debug: false,
   ),
 );
