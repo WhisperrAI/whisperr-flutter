@@ -87,6 +87,7 @@ class WhisperrClient {
 
   String? _sessionId;
   int? _lastEventMono;
+  DateTime? _lastEventWall;
   int _visitScreens = 0;
   final Set<String> _visitScreenNames = {};
   int _visitEvents = 0;
@@ -1438,16 +1439,24 @@ class WhisperrClient {
   }
 
   /// The current session id, rolled lazily: a new one on the first event of
-  /// this process (cold start) and after 30 minutes without an event.
+  /// this process (cold start) and after 30 minutes without an event. The
+  /// gap is measured on both clocks: the monotonic one can stop while the
+  /// device sleeps, and the wall clock can be changed by the user.
   String _currentSession() {
     final now = _monotonicMs();
+    final wall = _clock();
     final last = _lastEventMono;
+    final lastWall = _lastEventWall;
+    final idleMs = kWhisperrSessionIdle.inMilliseconds;
     var id = _sessionId;
     if (id == null ||
-        (last != null && now - last >= kWhisperrSessionIdle.inMilliseconds)) {
+        (last != null && now - last >= idleMs) ||
+        (lastWall != null &&
+            wall.difference(lastWall).inMilliseconds >= idleMs)) {
       id = _sessionId = newSessionId(_idRandom);
     }
     _lastEventMono = now;
+    _lastEventWall = wall;
     return id;
   }
 
@@ -1533,6 +1542,12 @@ class WhisperrClient {
     _earlySignals.add((signal: signal, at: _monotonicMs()));
     while (_earlySignals.length > 5) {
       _earlySignals.removeAt(0);
+    }
+    // A push tap brings the app to the foreground, often before the
+    // lifecycle reports it: start the visit now so app_opened (as `push`)
+    // goes out before push_opened. The later `resumed` is then a no-op.
+    if (signal.source == 'push' && _inBackground) {
+      unawaited(_guard(_enterForeground));
     }
   }
 
@@ -1624,7 +1639,8 @@ class WhisperrClient {
     }
     _errorFingerprints.add(fingerprint);
     _errorsSent++;
-    final screenName = screen?.trim() ?? _lastScreen;
+    final given = screen?.trim();
+    final screenName = given == null || given.isEmpty ? _lastScreen : given;
     await _trackSdkEvent('app_error', {
       'error_kind': kind,
       'fatal': fatal,

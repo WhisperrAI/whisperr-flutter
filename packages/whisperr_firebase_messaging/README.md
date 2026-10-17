@@ -18,8 +18,8 @@ Firebase part.
 
 ```yaml
 dependencies:
-  whisperr: ">=0.6.0 <0.8.0"
-  whisperr_firebase_messaging: ^0.1.0
+  whisperr: ">=0.6.0 <0.9.0"
+  whisperr_firebase_messaging: ^0.2.0
   firebase_messaging: ^16.0.0
 ```
 

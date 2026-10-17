@@ -8,6 +8,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:whisperr/src/navigator_observer.dart' show screenNameOf;
 import 'package:whisperr/src/signals.dart';
 import 'package:whisperr/whisperr.dart';
 
@@ -17,6 +18,9 @@ class _Harness {
   final persistence = InMemoryPersistence();
   final requests = <http.Request>[];
   DateTime now = DateTime.utc(2026, 10, 17, 12);
+
+  /// Monotonic ms; follows [now] unless a test freezes it (device sleep).
+  int? frozenMono;
 
   late final MockClient mock = MockClient((req) async {
     requests.add(req);
@@ -43,7 +47,7 @@ class _Harness {
           launchSourceWindow: window,
         ),
         clock: () => now,
-        monotonicMs: () => now.millisecondsSinceEpoch,
+        monotonicMs: () => frozenMono ?? now.millisecondsSinceEpoch,
         debugBuild: debugBuild,
         random: Random(3),
         deviceTraits: () => const {},
@@ -144,6 +148,35 @@ void main() {
       expect(ids.every((id) => id.startsWith('sess_')), isTrue);
       expect(ids.toSet().length, 2);
       expect(ids[ids.length - 2], isNot(ids.last));
+    });
+  });
+
+  group('sessions across device sleep', () {
+    test('rolls when the wall clock moves 31 min but the monotonic clock '
+        'stood still', () async {
+      final h = _Harness();
+      final c = h.client(window: Duration.zero);
+      await c.start();
+      await c.track('a');
+      h.frozenMono = h.now.millisecondsSinceEpoch;
+      h.now = h.now.add(const Duration(minutes: 31));
+      await c.track('b');
+      await c.close();
+      final ids = [
+        for (final e in h.events) (e['context'] as Map)['session_id'] as String
+      ];
+      expect(ids[ids.length - 2], isNot(ids.last));
+    });
+  });
+
+  group('screen names', () {
+    test('drop query and fragment and redact path ids', () {
+      expect(screenNameOf('/reset?token=abc'), '/reset');
+      expect(screenNameOf('/product/123'), '/product/:id');
+      expect(screenNameOf('/a#frag'), '/a');
+      expect(screenNameOf('Checkout'), 'Checkout');
+      expect(screenNameOf('?x=1'), isNull);
+      expect(screenNameOf(null), isNull);
     });
   });
 
@@ -292,6 +325,36 @@ void main() {
       expect(open['whisperr_message_id'], 'm1');
     });
 
+    test('a warm push tap before resumed sends app_opened first', () async {
+      final h = _Harness();
+      final c = h.client();
+      await c.start();
+      await c.flush();
+      c.handleLifecycleState(AppLifecycleState.paused);
+      await pumpEventQueue();
+      await c.trackPushOpened({'whisperr_message_id': 'm2'});
+      c.handleLifecycleState(AppLifecycleState.resumed); // no second open
+      await pumpEventQueue();
+      await c.close();
+      final types = h.events.map((e) => e['event_type']).toList();
+      expect(types.where((t) => t == 'app_opened'), hasLength(2));
+      expect(types.lastIndexOf('app_opened'),
+          lessThan(types.indexOf('push_opened')));
+      final warm = _props(h.named('app_opened').last);
+      expect(warm['launch_source'], 'push');
+      expect(warm['cold_start'], false);
+    });
+
+    test('trackError with an empty screen uses the last screen', () async {
+      final h = _Harness();
+      final c = h.client(window: Duration.zero);
+      await c.start();
+      await c.screen('Cart');
+      await c.trackError(Exception(), name: 'X', screen: '');
+      await c.close();
+      expect(_props(h.named('app_error').single)['screen_name'], 'Cart');
+    });
+
     test('handleLaunchUri sets the source; flush ends the window', () async {
       final h = _Harness();
       final c = h.client();
@@ -321,14 +384,23 @@ void main() {
           pageBuilder: (_, __, ___) => const SizedBox());
       final unnamed =
           PageRouteBuilder<void>(pageBuilder: (_, __, ___) => const SizedBox());
-      observer.didPush(home, null);
+      final reset = PageRouteBuilder<void>(
+          settings: const RouteSettings(name: '/reset?token=abc'),
+          pageBuilder: (_, __, ___) => const SizedBox());
+      final product = PageRouteBuilder<void>(
+          settings: const RouteSettings(name: '/product/123'),
+          pageBuilder: (_, __, ___) => const SizedBox());
+      observer.didPush(reset, null);
+      observer.didPush(product, reset);
+      observer.didPush(home, product);
       observer.didPush(cart, home);
       observer.didPush(unnamed, cart);
       observer.didPop(cart, home);
       await pumpEventQueue();
       await c.close();
       expect(h.named('screen_viewed').map((e) => _props(e)['screen_name']),
-          ['/home', '/cart', '/home']);
+          ['/reset', '/product/:id', '/home', '/cart', '/home']);
+      expect(jsonEncode(h.events), isNot(contains('token=')));
     });
   });
 }

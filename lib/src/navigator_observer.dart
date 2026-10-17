@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/widgets.dart';
 
+import 'signals.dart';
 import 'whisperr_client.dart';
 
 /// Sends `screen_viewed` for each page route the app navigates to, named by
@@ -11,8 +12,9 @@ import 'whisperr_client.dart';
 /// MaterialApp(navigatorObservers: [WhisperrNavigatorObserver()]);
 /// ```
 ///
-/// Only [PageRoute]s count (dialogs and popups do not). A route without a
-/// name is skipped unless [nameOf] names it. A pop reports the route it
+/// Only [PageRoute]s count (dialogs and popups do not). The query and
+/// fragment of a name are dropped, and in a path name (`/orders/123`) ids
+/// become `:id`. A route without a name is skipped unless [nameOf] names it. A pop reports the route it
 /// returns to. It uses [client], else the [Whisperr] singleton once it is
 /// initialized.
 class WhisperrNavigatorObserver extends NavigatorObserver {
@@ -41,8 +43,8 @@ class WhisperrNavigatorObserver extends NavigatorObserver {
 
   void _report(Route<dynamic> route) {
     if (route is! PageRoute) return;
-    final name = (nameOf ?? _settingsName)(route)?.trim();
-    if (name == null || name.isEmpty) return;
+    final name = screenNameOf((nameOf ?? _settingsName)(route));
+    if (name == null) return;
     final target =
         client ?? (Whisperr.isInitialized ? Whisperr.instance : null);
     if (target == null) return;
@@ -54,4 +56,17 @@ class WhisperrNavigatorObserver extends NavigatorObserver {
   }
 
   static String? _settingsName(Route<dynamic> route) => route.settings.name;
+}
+
+/// A route name as a screen name: the query and fragment dropped, and for a
+/// path (`/…`) ids replaced by `:id`, so tokens and ids in a route never
+/// leave the device. Null when nothing is left.
+@visibleForTesting
+String? screenNameOf(String? raw) {
+  if (raw == null) return null;
+  var name = raw.trim();
+  final cut = name.indexOf(RegExp(r'[?#]'));
+  if (cut != -1) name = name.substring(0, cut);
+  if (name.startsWith('/')) name = redactRoute(name);
+  return name.isEmpty ? null : name;
 }
