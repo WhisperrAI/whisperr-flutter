@@ -244,7 +244,8 @@ receipts are not reported.
 Record product events. Buffered and sent in batches; the timestamp is captured at call time, so events recorded offline keep their real time.
 
 ```dart
-Whisperr.instance.track('checkout_completed', properties: {'amount': 42, 'currency': 'USD'});
+// Your app's core action. This event name is only an example.
+Whisperr.instance.track('report_exported', properties: {'format': 'pdf'});
 ```
 
 > Event names must be `snake_case`. Only events that map to the events you configured during onboarding drive interventions; others are accepted but inert.
