@@ -616,6 +616,7 @@ void main() {
       for (final e in h.events) {
         final ctx = Map<String, dynamic>.from(e['context'] as Map)
           ..remove(r'$message_id');
+        expect(ctx.remove('session_id'), startsWith('sess_'));
         expect(
             ctx,
             {
@@ -639,6 +640,7 @@ void main() {
       await c.flush();
       final ctx = Map<String, dynamic>.from(h.events.single['context'] as Map)
         ..remove(r'$message_id');
+      expect(ctx.remove('session_id'), startsWith('sess_'));
       expect(ctx, {
         'sdk_name': 'whisperr-flutter',
         'sdk_version': kWhisperrSdkVersion,

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
@@ -10,10 +11,11 @@ import 'app_context.dart';
 import 'device_traits.dart';
 import 'models.dart';
 import 'persistence.dart';
+import 'signals.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.7.0';
+const String kWhisperrSdkVersion = '0.8.0';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
@@ -55,6 +57,8 @@ class WhisperrClient {
     Random? random,
     Map<String, Object?> Function()? deviceTraits,
     Future<Map<String, Object?>> Function()? appContext,
+    int Function()? monotonicMs,
+    bool? debugBuild,
   })  : _api = apiClient,
         _persistence = persistence,
         _options = options,
@@ -62,7 +66,51 @@ class WhisperrClient {
         _random = random ?? Random(),
         _idRandom = random ?? _secureRandom(),
         _deviceTraits = deviceTraits ?? defaultDeviceTraits,
-        _appContextResolver = appContext ?? defaultAppContext;
+        _appContextResolver = appContext ?? defaultAppContext,
+        _monotonicMs = monotonicMs ?? _stopwatchMs(),
+        _debugBuild = debugBuild ?? kDebugMode;
+
+  static int Function() _stopwatchMs() {
+    final watch = Stopwatch()..start();
+    return () => watch.elapsedMilliseconds;
+  }
+
+  /// Monotonic milliseconds: `foreground_ms` and the session idle rule.
+  final int Function() _monotonicMs;
+
+  /// Debug builds never send `app_crashed` (restarts from the debugger look
+  /// like crashes). Injectable for tests.
+  final bool _debugBuild;
+
+  // --- engagement signals (sessions, visits, launch source, errors) ---
+
+  String? _sessionId;
+  int? _lastEventMono;
+  int _visitScreens = 0;
+  final Set<String> _visitScreenNames = {};
+  int _visitEvents = 0;
+  int _visitErrors = 0;
+  String? _lastScreen;
+  String? _errorSessionId;
+  final Set<String> _errorFingerprints = {};
+  int _errorsSent = 0;
+  int? _foregroundMono;
+
+  /// The held `app_opened` while its attribution window is open.
+  _PendingOpen? _pendingOpen;
+
+  /// Launch signals that arrived while in the background, just before the
+  /// foreground they launched.
+  final List<({LaunchSignal signal, int at})> _earlySignals = [];
+
+  /// Set when this launch sent `app_updated`; the next `app_opened` carries
+  /// `first_after_update: true`.
+  bool _firstAfterUpdate = false;
+
+  FlutterExceptionHandler? _ourFlutterHandler;
+  FlutterExceptionHandler? _prevFlutterHandler;
+  bool Function(Object, StackTrace)? _ourPlatformHandler;
+  bool Function(Object, StackTrace)? _prevPlatformHandler;
 
   final WhisperrApiClient _api;
   final WhisperrPersistence _persistence;
@@ -155,7 +203,6 @@ class WhisperrClient {
   /// Lifecycle bookkeeping for `app_opened` / `app_backgrounded`.
   bool _inBackground = false;
   bool _coldOpenPending = false;
-  DateTime? _foregroundSince;
   bool _started = false;
 
   /// Set by [start]; [optOut] waits for it so it sees the restored pair.
@@ -199,7 +246,7 @@ class WhisperrClient {
     final restoring = _restoring = _restore();
     final hadPriorState = await restoring;
 
-    _timer = Timer.periodic(_options.flushInterval, (_) => unawaited(flush()));
+    _timer = Timer.periodic(_options.flushInterval, (_) => unawaited(_drainQueue()));
 
     if (_options.flushOnLifecyclePause || _options.trackAutomaticEvents) {
       try {
@@ -232,11 +279,15 @@ class WhisperrClient {
     }
     await _guard(() => _mutateIdentity(_reRegisterStalePushToken));
 
+    if (_options.trackAutomaticEvents && _options.captureErrors) {
+      _installErrorHandlers();
+    }
+
     if (_options.trackAutomaticEvents) {
       await _trackLaunch(hadPriorState: hadPriorState);
     }
 
-    if (_queue.isNotEmpty) unawaited(flush());
+    if (_queue.isNotEmpty) unawaited(_drainQueue());
   }
 
   /// Applies an app-lifecycle transition. Called by the SDK's own
@@ -256,7 +307,7 @@ class WhisperrClient {
       case AppLifecycleState.resumed:
         unawaited(_guard(_enterForeground));
       case AppLifecycleState.detached:
-        if (_options.flushOnLifecyclePause) unawaited(flush());
+        if (_options.flushOnLifecyclePause) unawaited(_drainQueue());
       case AppLifecycleState.inactive:
         break;
     }
@@ -429,7 +480,7 @@ class WhisperrClient {
         if (!denied) _pendingPushToken = null;
       },
     );
-    unawaited(flush());
+    unawaited(_drainQueue());
   }
 
   /// Captures the device push token.
@@ -548,7 +599,7 @@ class WhisperrClient {
         await _persistPushState();
       },
     );
-    unawaited(flush());
+    unawaited(_drainQueue());
   }
 
   /// The subject a push token goes under now: the current user, else this
@@ -658,7 +709,7 @@ class WhisperrClient {
     _permission =
         WhisperrPermissionRecord(current: status, sent: report ? status : sent);
     await _persistPermission();
-    if (report) unawaited(flush());
+    if (report) unawaited(_drainQueue());
 
     if (_optedOut) return;
     if (status == WhisperrPushPermission.denied) {
@@ -679,7 +730,7 @@ class WhisperrClient {
           await _persistPushState();
         },
       );
-      unawaited(flush());
+      unawaited(_drainQueue());
     } else if (status.allowsPush) {
       final reg = _pendingPushToken;
       if (reg == null) return;
@@ -897,7 +948,7 @@ class WhisperrClient {
           : null,
       restoreMerge: true,
     ));
-    unawaited(flush());
+    unawaited(_drainQueue());
   }
 
   Future<void> _persistAppLanguage() async {
@@ -925,11 +976,28 @@ class WhisperrClient {
   /// The event `context` carries `app_version`, `app_build`, `platform`,
   /// `sdk_name` and `sdk_version` (a key the platform cannot provide is
   /// absent). A key you pass in [context] wins.
+  ///
+  /// Every event carries `context.session_id`: a new session starts on each
+  /// cold start and after 30 minutes without an event.
   Future<void> track(
     String eventType, {
     Map<String, dynamic>? properties,
     Map<String, dynamic>? context,
     String? userId,
+  }) =>
+      _track(eventType,
+          properties: properties,
+          context: context,
+          userId: userId,
+          automatic: false);
+
+  Future<void> _track(
+    String eventType, {
+    Map<String, dynamic>? properties,
+    Map<String, dynamic>? context,
+    String? userId,
+    required bool automatic,
+    DateTime? at,
   }) async {
     _ensureUsable();
     if (_optedOut) return;
@@ -950,9 +1018,11 @@ class WhisperrClient {
     // The op id doubles as the idempotency key: it's stable across retries
     // (the queue is durable) so the server can dedup at-least-once redelivery.
     final messageId = _nextId();
+    if (!automatic) _visitEvents++;
     final mergedContext = <String, dynamic>{
       ..._eventContext(),
       if (context != null) ...context,
+      'session_id': _currentSession(),
       r'$message_id': messageId,
     };
     final body = <String, dynamic>{
@@ -962,7 +1032,7 @@ class WhisperrClient {
       else
         'anonymous_id': _ensureAnonymousId(),
       'event_type': type,
-      'occurred_at': _occurredAtIso(),
+      'occurred_at': _occurredAtIso(at),
       'properties': properties ?? <String, dynamic>{},
       'context': mergedContext,
     };
@@ -970,7 +1040,7 @@ class WhisperrClient {
     await _enqueue(
         WhisperrQueueOp(id: messageId, kind: WhisperrOpKind.track, body: body));
 
-    if (_queue.length >= _options.flushAt) unawaited(flush());
+    if (_queue.length >= _options.flushAt) unawaited(_drainQueue());
   }
 
   /// Records a screen view: sends `screen_viewed` with `screen_name` and the
@@ -982,6 +1052,12 @@ class WhisperrClient {
   }) async {
     final name = screenName.trim();
     if (name.isEmpty) return;
+    if (!_closed && !_optedOut) {
+      _visitScreens++;
+      _visitScreenNames.add(name);
+      _lastScreen = name;
+      if (_foregroundMono != null) unawaited(_saveRunRecord());
+    }
     await _trackSdkEvent('screen_viewed', {
       ...?properties,
       'screen_name': name,
@@ -1019,6 +1095,9 @@ class WhisperrClient {
       _pushOpened.removeAt(0);
     }
     await _persistPushOpened();
+    // A tap that opened the app: the held app_opened goes first, as `push`.
+    final mid = id.length > 128 ? id.substring(0, 128) : id;
+    _noteLaunchSignal(LaunchSignal('push', {'whisperr_message_id': mid}));
     final deepLink = open.deepLink;
     final action = actionId?.trim();
     await _trackSdkEvent('push_opened', {
@@ -1027,7 +1106,7 @@ class WhisperrClient {
       'action_id': action == null || action.isEmpty ? 'default' : action,
       if (coldStart != null) 'cold_start': coldStart,
     });
-    unawaited(flush());
+    unawaited(_drainQueue());
     return true;
   }
 
@@ -1063,7 +1142,7 @@ class WhisperrClient {
       'foreground': true,
       'source': 'foreground',
     });
-    unawaited(flush());
+    unawaited(_drainQueue());
     return true;
   }
 
@@ -1097,7 +1176,7 @@ class WhisperrClient {
         ..addAll(next);
     });
     await _persistPushState();
-    unawaited(flush());
+    unawaited(_drainQueue());
   }
 
   /// The queue that stays while opted out: the push opt-outs already queued,
@@ -1138,7 +1217,7 @@ class WhisperrClient {
     if (!_optedOut) return;
     _optedOut = false;
     await _persistOptOut();
-    unawaited(flush());
+    unawaited(_drainQueue());
   }
 
   /// Calls [WhisperrClient.optOut] for `true` and [optIn] for `false`.
@@ -1160,7 +1239,16 @@ class WhisperrClient {
 
   /// Forces a flush and completes when the drain pass finishes (whether it
   /// emptied the queue or stopped on a transient/auth error).
+  ///
+  /// It also ends the launch-source window: a held `app_opened` goes out
+  /// first, with the source known so far (`direct` when none).
   Future<void> flush() {
+    _finishOpen();
+    // Waits for queue writes already issued (an un-awaited automatic event).
+    return _queueTail.then((_) => _drainQueue());
+  }
+
+  Future<void> _drainQueue() {
     if (_closed || !_headDeliverable) return Future.value();
     return _flushing ??= _drain().whenComplete(() => _flushing = null);
   }
@@ -1218,7 +1306,7 @@ class WhisperrClient {
         _log('reset could not move the push token ($e)');
       }
     }
-    if (!flushBeforeReset) unawaited(flush());
+    if (!flushBeforeReset) unawaited(_drainQueue());
   }
 
   /// Flushes, stops timers, and releases resources. The instance is unusable
@@ -1227,6 +1315,8 @@ class WhisperrClient {
     if (_closed) return;
     await flush();
     _closed = true;
+    _uninstallErrorHandlers();
+    _earlySignals.clear();
     _timer?.cancel();
     _timer = null;
     _restoreTimer?.cancel();
@@ -1242,13 +1332,16 @@ class WhisperrClient {
   // --- internals ---
 
   /// The launch's automatic events: `app_installed` on the first launch,
-  /// `app_updated` when the version or build changed, then `app_opened`.
+  /// `app_updated` when the version or build changed, `app_crashed` when the
+  /// last run ended in the foreground without going to the background, then
+  /// `app_opened` (held for its launch source).
   Future<void> _trackLaunch({required bool hadPriorState}) async {
     try {
       await _trackInstallOrUpdate(hadPriorState: hadPriorState);
     } catch (e) {
       _log('install/update detection failed ($e)');
     }
+    await _guard(_detectCrash);
     // A process started in the background (e.g. by a push) is not an open:
     // report the cold start when the app first comes to the foreground.
     final state = _currentLifecycleState();
@@ -1258,8 +1351,8 @@ class WhisperrClient {
       _coldOpenPending = true;
       return;
     }
-    _foregroundSince = _clock();
-    await _guard(() => _trackSdkEvent('app_opened', {'cold_start': true}));
+    _beginVisit();
+    _holdOpen(coldStart: true);
   }
 
   Future<void> _trackInstallOrUpdate({required bool hadPriorState}) async {
@@ -1292,6 +1385,7 @@ class WhisperrClient {
           'previous_version': previous['version'],
         if (previous['build'] != null) 'previous_build': previous['build'],
       });
+      _firstAfterUpdate = true;
     }
     if (previous == null || version != null) {
       await _persistence.save(WhisperrPersistence.appSlot,
@@ -1302,35 +1396,397 @@ class WhisperrClient {
   Future<void> _enterBackground() async {
     if (!_inBackground) {
       _inBackground = true;
-      final since = _foregroundSince;
-      _foregroundSince = null;
+      // A held app_opened goes first, with what is known.
+      _finishOpen();
+      final since = _foregroundMono;
+      _foregroundMono = null;
       if (_options.trackAutomaticEvents) {
+        final session = _currentSession();
         await _trackSdkEvent('app_backgrounded', {
-          if (since != null)
-            'foreground_ms': max(0, _clock().difference(since).inMilliseconds),
+          if (since != null) 'foreground_ms': max(0, _monotonicMs() - since),
+          'session_id': session,
+          'screen_count': _visitScreens,
+          'unique_screen_count': _visitScreenNames.length,
+          'event_count': _visitEvents,
+          'error_count': _visitErrors,
         });
+        await _clearRunRecord();
       }
     }
-    if (_options.flushOnLifecyclePause) await flush();
+    if (_options.flushOnLifecyclePause) await _drainQueue();
   }
 
   Future<void> _enterForeground() async {
     if (!_inBackground) return;
     _inBackground = false;
-    _foregroundSince = _clock();
     final cold = _coldOpenPending;
     _coldOpenPending = false;
-    if (_options.trackAutomaticEvents) {
-      await _trackSdkEvent('app_opened', {'cold_start': cold});
+    _beginVisit();
+    if (_options.trackAutomaticEvents) _holdOpen(coldStart: cold);
+  }
+
+  /// Starts a foreground visit: resets the `app_backgrounded` counters and
+  /// marks this run as running in the foreground (the unclean-shutdown flag).
+  void _beginVisit() {
+    _foregroundMono = _monotonicMs();
+    _visitScreens = 0;
+    _visitScreenNames.clear();
+    _visitEvents = 0;
+    _visitErrors = 0;
+    unawaited(_saveRunRecord());
+  }
+
+  /// The current session id, rolled lazily: a new one on the first event of
+  /// this process (cold start) and after 30 minutes without an event.
+  String _currentSession() {
+    final now = _monotonicMs();
+    final last = _lastEventMono;
+    var id = _sessionId;
+    if (id == null ||
+        (last != null && now - last >= kWhisperrSessionIdle.inMilliseconds)) {
+      id = _sessionId = newSessionId(_idRandom);
     }
+    _lastEventMono = now;
+    return id;
+  }
+
+  // --- launch source ---
+
+  /// After a link signal, how long the held `app_opened` still waits for a
+  /// push tap (which wins over a link).
+  static const Duration _linkGrace = Duration(milliseconds: 300);
+
+  /// Holds `app_opened` for its launch source (see
+  /// [WhisperrOptions.launchSourceWindow]).
+  void _holdOpen({required bool coldStart}) {
+    _finishOpen();
+    final now = _monotonicMs();
+    final windowMs = _options.launchSourceWindow.inMilliseconds;
+    LaunchSignal? signal;
+    for (final early in _earlySignals) {
+      if (now - early.at <= windowMs) {
+        signal = LaunchSignal.stronger(signal, early.signal);
+      }
+    }
+    _earlySignals.clear();
+    final properties = <String, dynamic>{'cold_start': coldStart};
+    if (_firstAfterUpdate) {
+      properties['first_after_update'] = true;
+      _firstAfterUpdate = false;
+    }
+    _pendingOpen = _PendingOpen(properties, _clock(), now + windowMs, signal);
+    if (windowMs <= 0 || signal?.source == 'push') {
+      _finishOpen();
+    } else {
+      _scheduleOpen(signal != null ? _linkGrace : _options.launchSourceWindow);
+    }
+  }
+
+  void _scheduleOpen(Duration wait) {
+    final pending = _pendingOpen;
+    if (pending == null) return;
+    pending.timer?.cancel();
+    final left = max(0, pending.deadlineMono - _monotonicMs());
+    pending.timer = Timer(
+        Duration(milliseconds: min(wait.inMilliseconds, left)), _finishOpen);
+  }
+
+  /// Sends the held `app_opened` with the strongest launch signal seen
+  /// (`direct` when none). Returns whether one was held.
+  bool _finishOpen() {
+    final pending = _pendingOpen;
+    if (pending == null) return false;
+    _pendingOpen = null;
+    pending.timer?.cancel();
+    final signal = pending.signal;
+    unawaited(_guard(() => _trackSdkEvent(
+          'app_opened',
+          {
+            ...pending.properties,
+            'launch_source': signal?.source ?? 'direct',
+            ...?signal?.properties,
+          },
+          at: pending.at,
+        )));
+    return true;
+  }
+
+  /// A push tap or a link: it sets the launch source of the held
+  /// `app_opened`, or of the next one when it arrives while the app is still
+  /// in the background. One while the app is in the foreground is not a
+  /// launch.
+  void _noteLaunchSignal(LaunchSignal signal) {
+    if (_closed || !_options.trackAutomaticEvents) return;
+    final pending = _pendingOpen;
+    if (pending != null) {
+      final best = LaunchSignal.stronger(pending.signal, signal);
+      pending.signal = best;
+      if (best?.source == 'push') {
+        _finishOpen();
+      } else {
+        _scheduleOpen(_linkGrace);
+      }
+      return;
+    }
+    if (_foregroundMono != null && !_inBackground) return;
+    _earlySignals.add((signal: signal, at: _monotonicMs()));
+    while (_earlySignals.length > 5) {
+      _earlySignals.removeAt(0);
+    }
+  }
+
+  /// Reports the link that opened the app: a deep link (custom scheme), a
+  /// universal / app link (http or https), or a widget or shortcut link
+  /// (`wsrc=widget` / `wsrc=shortcut` in its query). Pass it the initial
+  /// link and every link that brings the app to the foreground, for example
+  /// from `app_links` or `uni_links`:
+  ///
+  /// ```dart
+  /// AppLinks().uriLinkStream.listen(Whisperr.instance.handleLaunchUri);
+  /// ```
+  ///
+  /// It sets `launch_source` on the `app_opened` of that launch, with
+  /// `link_route` (the path only, ids replaced by `:id`), `link_host` (http
+  /// and https links), `utm_source` / `utm_medium` / `utm_campaign` when
+  /// present, and `whisperr_message_id` for a Whisperr email link (`wmid`).
+  /// The query and fragment are never sent. A link while the app is already
+  /// in the foreground sends nothing. A push tap wins over a link.
+  void handleLaunchUri(Uri uri) {
+    final signal = linkSignal(uri);
+    if (signal != null) _noteLaunchSignal(signal);
+  }
+
+  // --- errors and crashes ---
+
+  /// Reports a handled error as `app_error` with `error_kind` [kind]
+  /// (`handled` by default; also `network`, `screen`, `dart`, `native`),
+  /// the error's type name (or [name], for example `HTTP_500`), a
+  /// fingerprint of the top 3 frames of [stackTrace] (for an [Error], its own
+  /// stack trace by default), and `screen_name`: [screen], else the last
+  /// screen recorded with [screen]. The message and the stack are never sent.
+  ///
+  /// One `app_error` per fingerprint per session, at most 20 per session.
+  /// It is batched like any event and never forces a flush. A no-op while
+  /// opted out or after [close].
+  Future<void> trackError(
+    Object error, {
+    StackTrace? stackTrace,
+    String? screen,
+    String? kind,
+    String? name,
+  }) {
+    final k = kind != null && kWhisperrErrorKinds.contains(kind.trim())
+        ? kind.trim()
+        : 'handled';
+    final stack = stackTrace ?? (error is Error ? error.stackTrace : null);
+    return _guard(() => _recordError(error, stack,
+        kind: k, fatal: false, screen: screen, name: name));
+  }
+
+  /// An uncaught error from the SDK's global handlers. Public only so tests
+  /// can drive it. [fatal] records it for the next launch's `app_crashed`.
+  @visibleForTesting
+  void captureUncaughtError(Object error, StackTrace? stack,
+      {bool fatal = false}) {
+    if (_closed || !_options.captureErrors || !_options.trackAutomaticEvents) {
+      return;
+    }
+    if (fatal) unawaited(_saveFatalRecord());
+    unawaited(
+        _guard(() => _recordError(error, stack, kind: 'dart', fatal: fatal)));
+  }
+
+  Future<void> _recordError(
+    Object error,
+    StackTrace? stack, {
+    required String kind,
+    required bool fatal,
+    String? screen,
+    String? name,
+  }) async {
+    if (_closed || _optedOut) return;
+    _visitErrors++; // the true total, including what the caps drop
+    final session = _currentSession();
+    if (session != _errorSessionId) {
+      _errorSessionId = session;
+      _errorFingerprints.clear();
+      _errorsSent = 0;
+    }
+    final custom = name?.trim();
+    final errorName = custom != null && custom.isNotEmpty
+        ? (custom.length > 64 ? custom.substring(0, 64) : custom)
+        : errorTypeName(error);
+    final fingerprint = errorFingerprint(errorName, stackFrameNames(stack));
+    if (_errorFingerprints.contains(fingerprint) ||
+        _errorsSent >= kWhisperrMaxErrorsPerSession) {
+      return;
+    }
+    _errorFingerprints.add(fingerprint);
+    _errorsSent++;
+    final screenName = screen?.trim() ?? _lastScreen;
+    await _trackSdkEvent('app_error', {
+      'error_kind': kind,
+      'fatal': fatal,
+      'error_name': errorName,
+      'fingerprint': fingerprint,
+      if (screenName != null && screenName.isNotEmpty)
+        'screen_name': screenName,
+      'session_id': session,
+    });
+  }
+
+  /// Chains the SDK into `FlutterError.onError` and
+  /// `PlatformDispatcher.instance.onError`; the handlers that were set before
+  /// are still called.
+  void _installErrorHandlers() {
+    final prevFlutter = FlutterError.onError;
+    void flutterHandler(FlutterErrorDetails details) {
+      try {
+        captureUncaughtError(details.exception, details.stack);
+      } catch (_) {
+        // never break the app's own handler
+      }
+      prevFlutter?.call(details);
+    }
+
+    _prevFlutterHandler = prevFlutter;
+    _ourFlutterHandler = flutterHandler;
+    FlutterError.onError = flutterHandler;
+    try {
+      final dispatcher = PlatformDispatcher.instance;
+      final prevPlatform = dispatcher.onError;
+      bool platformHandler(Object error, StackTrace stack) {
+        try {
+          captureUncaughtError(error, stack);
+        } catch (_) {
+          // never break the app's own handler
+        }
+        return prevPlatform?.call(error, stack) ?? false;
+      }
+
+      _prevPlatformHandler = prevPlatform;
+      _ourPlatformHandler = platformHandler;
+      dispatcher.onError = platformHandler;
+    } catch (e) {
+      _log('PlatformDispatcher.onError unavailable ($e)');
+    }
+  }
+
+  /// Puts the previous handlers back when the SDK's are still installed.
+  void _uninstallErrorHandlers() {
+    final ours = _ourFlutterHandler;
+    if (ours != null && identical(FlutterError.onError, ours)) {
+      FlutterError.onError = _prevFlutterHandler;
+    }
+    _ourFlutterHandler = null;
+    _prevFlutterHandler = null;
+    final ourPlatform = _ourPlatformHandler;
+    if (ourPlatform != null) {
+      try {
+        final dispatcher = PlatformDispatcher.instance;
+        if (identical(dispatcher.onError, ourPlatform)) {
+          dispatcher.onError = _prevPlatformHandler;
+        }
+      } catch (_) {
+        // no dispatcher
+      }
+    }
+    _ourPlatformHandler = null;
+    _prevPlatformHandler = null;
+  }
+
+  bool get _tracksRuns =>
+      _options.trackAutomaticEvents && _options.enablePersistence;
+
+  /// Serializes run-state writes so the last one wins.
+  Future<void> _runTail = Future.value();
+
+  Future<void> _runWrite(Future<void> Function() write) {
+    final next = _runTail.then((_) => write()).catchError((Object e) {
+      _log('failed to persist run state ($e)');
+    });
+    _runTail = next;
+    return next;
+  }
+
+  /// The unclean-shutdown flag: this run is in the foreground.
+  Future<void> _saveRunRecord() {
+    if (!_tracksRuns || _closed) return Future.value();
+    final record = jsonEncode({
+      'running': true,
+      'session_id': _sessionId ?? _currentSession(),
+      if (_lastScreen != null) 'screen': _lastScreen,
+      if (_appContext['app_version'] != null)
+        'app_version': _appContext['app_version'],
+    });
+    return _runWrite(
+        () => _persistence.save(WhisperrPersistence.runStateSlot, record));
+  }
+
+  Future<void> _clearRunRecord() {
+    if (!_tracksRuns) return Future.value();
+    return _runWrite(() async {
+      await _persistence.clear(WhisperrPersistence.runStateSlot);
+      await _persistence.clear(WhisperrPersistence.lastFatalSlot);
+    });
+  }
+
+  Future<void> _saveFatalRecord() {
+    if (!_tracksRuns) return Future.value();
+    final record = jsonEncode({'at': _clock().millisecondsSinceEpoch});
+    return _runWrite(
+        () => _persistence.save(WhisperrPersistence.lastFatalSlot, record));
+  }
+
+  /// At launch: `app_crashed` when the last run left the unclean-shutdown
+  /// flag set (it was in the foreground and never went to the background).
+  /// A fatal error recorded by the handlers upgrades it to a crash. Never in
+  /// debug builds.
+  Future<void> _detectCrash() async {
+    if (!_tracksRuns) return;
+    final raw = await _persistence.load(WhisperrPersistence.runStateSlot);
+    final fatalRaw = await _persistence.load(WhisperrPersistence.lastFatalSlot);
+    if (raw == null && fatalRaw == null) return;
+    await _persistence.clear(WhisperrPersistence.runStateSlot);
+    await _persistence.clear(WhisperrPersistence.lastFatalSlot);
+    if (raw == null || _debugBuild) return;
+    final run = jsonDecode(raw);
+    if (run is! Map || run['running'] != true) return;
+    final fatal = fatalRaw == null ? null : jsonDecode(fatalRaw);
+    final upgrade = fatal is Map && _options.captureErrors;
+    DateTime? at;
+    if (upgrade && fatal['at'] is int) {
+      final t =
+          DateTime.fromMillisecondsSinceEpoch(fatal['at'] as int, isUtc: true);
+      final age = _clock().difference(t);
+      if (!age.isNegative && age < const Duration(days: 30)) at = t;
+    }
+    await _trackSdkEvent(
+      'app_crashed',
+      {
+        'crash_kind': upgrade ? 'crash' : 'abnormal_exit',
+        'detected_by': upgrade ? 'dart_fatal' : 'unclean_shutdown',
+        if (run['app_version'] is String)
+          'crashed_app_version': run['app_version'],
+        if (run['session_id'] is String)
+          'crashed_session_id': run['session_id'],
+        if (run['screen'] is String) 'crashed_screen_name': run['screen'],
+        'foreground': true,
+      },
+      at: at,
+    );
   }
 
   /// Tracks an SDK-named event with the app/OS context merged under its own
   /// properties. Never throws for a closed client: lifecycle callbacks can
   /// race [close].
-  Future<void> _trackSdkEvent(String type, Map<String, dynamic> properties) {
+  Future<void> _trackSdkEvent(String type, Map<String, dynamic> properties,
+      {DateTime? at}) {
     if (_closed || _optedOut) return Future.value();
-    return track(type, properties: {..._automaticProperties(), ...properties});
+    return _track(type,
+        properties: {..._automaticProperties(), ...properties},
+        automatic: true,
+        at: at);
   }
 
   /// `sdk_name`, `sdk_version`, `app_version`, `app_build`, `os_name`,
@@ -1427,7 +1883,7 @@ class WhisperrClient {
         if (traits.isNotEmpty) 'traits': traits,
       },
     ));
-    unawaited(flush());
+    unawaited(_drainQueue());
   }
 
   /// Stores what a delivered identify said about the restore traits. A
@@ -1983,8 +2439,8 @@ class WhisperrClient {
   String _nextId() =>
       '${_clock().microsecondsSinceEpoch}-${_seq++}-${_random.nextInt(0x7fffffff)}';
 
-  String _occurredAtIso() {
-    final t = _clock().toUtc();
+  String _occurredAtIso([DateTime? at]) {
+    final t = (at ?? _clock()).toUtc();
     return DateTime.fromMillisecondsSinceEpoch(t.millisecondsSinceEpoch,
             isUtc: true)
         .toIso8601String();
@@ -2106,4 +2562,17 @@ WhisperrQueueOp? _pushRetirements(WhisperrQueueOp op) {
       'channels': retired,
     },
   );
+}
+
+/// An `app_opened` held while its launch source is unknown.
+class _PendingOpen {
+  _PendingOpen(this.properties, this.at, this.deadlineMono, this.signal);
+
+  final Map<String, dynamic> properties;
+
+  /// When the app came to the foreground: the event's `occurred_at`.
+  final DateTime at;
+  final int deadlineMono;
+  LaunchSignal? signal;
+  Timer? timer;
 }

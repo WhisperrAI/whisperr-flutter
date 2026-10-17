@@ -78,6 +78,7 @@ class _Harness {
         maxRetries: maxRetries,
       ),
       clock: () => now,
+      monotonicMs: () => now.millisecondsSinceEpoch,
       random: random,
       deviceTraits: () => _deviceTraits,
       appContext: () async => appContext,
@@ -116,7 +117,8 @@ void main() {
 
       expect(h.eventTypes, ['app_installed', 'app_opened']);
       expect(_props(h.events[0]), {..._context});
-      expect(_props(h.events[1]), {..._context, 'cold_start': true});
+      expect(_props(h.events[1]),
+          {..._context, 'cold_start': true, 'launch_source': 'direct'});
       // Before identify they go out under the device's anonymous handle.
       for (final e in h.events) {
         expect(e.containsKey('external_user_id'), isFalse);
@@ -206,8 +208,18 @@ void main() {
 
       expect(h.eventTypes,
           ['app_installed', 'app_opened', 'app_backgrounded', 'app_opened']);
-      expect(_props(h.events[2]), {..._context, 'foreground_ms': 90000});
-      expect(_props(h.events[3]), {..._context, 'cold_start': false});
+      final session = (h.events[0]['context'] as Map)['session_id'];
+      expect(_props(h.events[2]), {
+        ..._context,
+        'foreground_ms': 90000,
+        'session_id': session,
+        'screen_count': 0,
+        'unique_screen_count': 0,
+        'event_count': 0,
+        'error_count': 0,
+      });
+      expect(_props(h.events[3]),
+          {..._context, 'cold_start': false, 'launch_source': 'direct'});
     });
 
     test('the switch turns all automatic events off', () async {

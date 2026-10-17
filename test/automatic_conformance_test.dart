@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart' show FlutterError, FlutterErrorDetails, FlutterExceptionHandler;
 import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -73,6 +74,12 @@ class _Case {
   bool get automatic =>
       (spec['config'] as Map?)?['automaticEvents'] as bool? ?? true;
 
+  bool get captureErrors =>
+      (spec['config'] as Map?)?['captureErrors'] as bool? ?? true;
+
+  bool get debugBuild =>
+      (spec['config'] as Map?)?['debugBuild'] as bool? ?? false;
+
   late final MockClient mock = MockClient((req) async {
     requests.add(req);
     return http.Response('{"accepted":1,"rejected":0}', 202);
@@ -92,11 +99,14 @@ class _Case {
         flushInterval: const Duration(hours: 1),
         flushOnLifecyclePause: false,
         trackAutomaticEvents: automatic,
+        captureErrors: captureErrors,
         retryBaseDelay: const Duration(milliseconds: 1),
         maxRetryDelay: const Duration(milliseconds: 5),
         maxRetries: 2,
       ),
       clock: () => now,
+      monotonicMs: () => now.millisecondsSinceEpoch,
+      debugBuild: debugBuild,
       random: random,
       deviceTraits: () => deviceTraits,
       appContext: () async => {
@@ -124,6 +134,8 @@ class _Case {
       for (final e in events) {
         expect((e['context'] as Map)[r'$message_id'], isNotNull,
             reason: '$name: context.\$message_id');
+        expect((e['context'] as Map)['session_id'], matches(_sessionPattern),
+            reason: '$name: context.session_id');
         contexts?.add(e['context'] as Map);
         out.add({'event_type': e['event_type'], 'properties': e['properties']});
       }
@@ -168,6 +180,35 @@ Future<void> _run(_Case c) async {
         // foreground and delivers the cold-start open itself.
         await next.start();
         await next.identify('user_1');
+        final via = launch['via'] as Map?;
+        if (via?['link'] != null) {
+          next.handleLaunchUri(Uri.parse(via!['link'] as String));
+        }
+        if (via?['push'] != null) {
+          await next.trackPushOpened(
+              Map<String, dynamic>.from(via!['push'] as Map),
+              coldStart: true);
+        }
+      case 'track':
+        await live().track(value as String);
+      case 'trackError':
+        final e = Map<String, dynamic>.from(value as Map);
+        await live().trackError(Exception('conformance'),
+            name: e['name'] as String,
+            kind: e['kind'] as String?,
+            screen: e['screen'] as String?);
+      case 'uncaughtError':
+        final e = Map<String, dynamic>.from(value as Map);
+        final error = _uncaught(e['name'] as String);
+        if (e['fatal'] == true) {
+          live().captureUncaughtError(error, StackTrace.current, fatal: true);
+        } else {
+          final before = _priorHandlerCalls;
+          FlutterError.onError!(
+              FlutterErrorDetails(exception: error, stack: StackTrace.current));
+          expect(_priorHandlerCalls, before + 1,
+              reason: '${c.name}: the prior FlutterError.onError still runs');
+        }
       case 'background':
         c.now =
             c.now.add(Duration(milliseconds: (value as Map)['afterMs'] as int));
@@ -214,6 +255,75 @@ Future<void> _run(_Case c) async {
   await client?.close();
 }
 
+final _sessionPattern = RegExp(
+    r'^sess_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$');
+
+int _priorHandlerCalls = 0;
+
+const _legacyEvents = {'app_error', 'app_crashed'};
+
+class OffersRenderError extends Error {}
+
+class CheckoutStateError extends Error {}
+
+Object _uncaught(String name) => switch (name) {
+      'OffersRenderError' => OffersRenderError(),
+      'CheckoutStateError' => CheckoutStateError(),
+      _ => throw StateError('no error type $name in this harness'),
+    };
+
+/// signalsV3 legacy rule: drop [legacyStrip.events], and remove the
+/// [legacyStrip.properties] keys the expected event does not name.
+List<Map<String, dynamic>> _legacy(Map<String, dynamic> spec,
+    List<Map<String, dynamic>> sent, List expected) {
+  final strip = (spec['signalsV3'] as Map)['legacyStrip'] as Map;
+  final events = (strip['events'] as List).cast<String>().toSet();
+  final keys = (strip['properties'] as List).cast<String>();
+  final kept = sent.where((e) => !events.contains(e['event_type'])).toList();
+  for (var i = 0; i < kept.length && i < expected.length; i++) {
+    final want = ((expected[i] as Map)['properties'] as Map?) ?? const {};
+    final props = Map<String, dynamic>.from(kept[i]['properties'] as Map);
+    for (final k in keys) {
+      if (!want.containsKey(k)) props.remove(k);
+    }
+    kept[i] = {...kept[i], 'properties': props};
+  }
+  return kept;
+}
+
+/// Binds `$session_<x>` / `$fp_<x>` placeholders (SPEC.md signalsV3).
+class _Binder {
+  final _bound = <String, Object?>{};
+
+  void check(Object? want, Object? got, String reason) {
+    if (want is String &&
+        (want.startsWith(r'$session_') || want.startsWith(r'$fp_'))) {
+      if (want.startsWith(r'$session_')) {
+        expect(got, matches(_sessionPattern), reason: reason);
+      } else {
+        expect(got, matches(RegExp(r'^[0-9a-f]{16}$')), reason: reason);
+      }
+      if (_bound.containsKey(want)) {
+        expect(got, _bound[want], reason: '$reason ($want)');
+      } else {
+        expect(_bound.values, isNot(contains(got)),
+            reason: '$reason ($want must be distinct)');
+        _bound[want] = got;
+      }
+      return;
+    }
+    if (want == r'$error_kind') {
+      expect(got, 'dart', reason: reason);
+      return;
+    }
+    if (want == r'$fatal_detected_by') {
+      expect(got, 'dart_fatal', reason: reason);
+      return;
+    }
+    expect(got, _bind(want), reason: reason);
+  }
+}
+
 /// The context keys a v2 expectation governs (SPEC.md -> Version context).
 const _governed = [
   'app_version',
@@ -231,6 +341,51 @@ bool _hasReceiptPath(Map<String, dynamic> c) =>
         s['receivePush']['source'] == 'foreground');
 
 void main() {
+  FlutterExceptionHandler? saved;
+  setUpAll(() {
+    saved = FlutterError.onError;
+    FlutterError.onError = (_) => _priorHandlerCalls++;
+  });
+  tearDownAll(() => FlutterError.onError = saved);
+
+  test('engagement signals conformance (signalsV3)', () async {
+    final spec = await _loadSpec();
+    final sections = (spec['signalsV3'] as Map)['sections'] as Map;
+    var ran = 0;
+    for (final entry in sections.entries) {
+      final section = entry.value as Map;
+      if (!(section['appliesTo'] as List).contains('mobile')) continue;
+      for (final raw in (section['cases'] as List).cast<Map<String, dynamic>>()) {
+        final c = _Case(raw);
+        await _run(c);
+        ran++;
+        final contexts = <Map<dynamic, dynamic>>[];
+        final sent = c.sentEvents(contexts);
+        final expected = raw['expectedEvents'] as List;
+        expect(sent.map((e) => e['event_type']).toList(),
+            expected.map((e) => (e as Map)['event_type']).toList(),
+            reason: c.name);
+        final binder = _Binder();
+        for (var i = 0; i < expected.length; i++) {
+          final e = expected[i] as Map;
+          final where = '${c.name} event[$i] ${e['event_type']}';
+          final want = Map<String, dynamic>.from(e['properties'] as Map);
+          final got = Map<String, dynamic>.from(sent[i]['properties'] as Map);
+          expect(got.keys.toSet(), want.keys.toSet(), reason: '$where keys');
+          for (final key in want.keys) {
+            binder.check(want[key], got[key], '$where.$key');
+          }
+          final ctx = e['context'] as Map?;
+          if (ctx != null && ctx['session_id'] != null) {
+            binder.check(ctx['session_id'], contexts[i]['session_id'],
+                '$where context.session_id');
+          }
+        }
+      }
+    }
+    expect(ran, greaterThan(0));
+  });
+
   test('automatic-events conformance, contract v2 push events (pushEventsV2)',
       () async {
     final spec = await _loadSpec();
@@ -242,9 +397,14 @@ void main() {
     for (final raw in cases) {
       final c = _Case(raw);
       await _run(c);
-      final contexts = <Map<dynamic, dynamic>>[];
-      final sent = c.sentEvents(contexts);
+      final allContexts = <Map<dynamic, dynamic>>[];
+      final all = c.sentEvents(allContexts);
       final expected = raw['expectedEvents'] as List;
+      final sent = _legacy(spec, all, expected);
+      final contexts = [
+        for (var i = 0; i < all.length; i++)
+          if (!_legacyEvents.contains(all[i]['event_type'])) allContexts[i]
+      ];
       expect(sent.length, expected.length, reason: c.name);
       for (var i = 0; i < expected.length; i++) {
         final e = expected[i] as Map;
@@ -290,7 +450,8 @@ void main() {
             'properties': _bind(e['properties']),
           }
       ];
-      expect(c.sentEvents(), expected, reason: c.name);
+      expect(_legacy(spec, c.sentEvents(), expected), expected,
+          reason: c.name);
     }
   });
 }
