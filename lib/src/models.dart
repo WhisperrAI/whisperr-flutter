@@ -74,19 +74,22 @@ enum WhisperrPushPermission {
 /// The notification permission state this device keeps, persisted next to
 /// the queue.
 class WhisperrPermissionRecord {
-  const WhisperrPermissionRecord({this.current, this.sent});
+  const WhisperrPermissionRecord({this.current, this.sent, this.os});
 
   /// Reads a stored record. A 0.5.x record (`{status, sent_for}`) carried the
   /// trait and never sent the event: its status stays the device's current
   /// permission, and nothing counts as sent.
   factory WhisperrPermissionRecord.fromJson(Map<dynamic, dynamic> json) {
-    if (!json.containsKey('current') && !json.containsKey('sent')) {
+    if (!json.containsKey('current') &&
+        !json.containsKey('sent') &&
+        !json.containsKey('os')) {
       return WhisperrPermissionRecord(
           current: WhisperrPushPermission.values.asNameMap()[json['status']]);
     }
     return WhisperrPermissionRecord(
       current: WhisperrPushPermission.fromWire(json['current']),
       sent: WhisperrPushPermission.fromWire(json['sent']),
+      os: WhisperrPushPermission.fromWire(json['os']),
     );
   }
 
@@ -98,11 +101,17 @@ class WhisperrPermissionRecord {
   /// Null when none was sent since install or the last reset().
   final WhisperrPushPermission? sent;
 
-  bool get isEmpty => current == null && sent == null;
+  /// The OS permission the SDK last read itself (automatic reporting). An
+  /// automatic read reports only when the OS answer differs from it, so a
+  /// value set with `setPushPermission` stands until the OS setting changes.
+  final WhisperrPushPermission? os;
+
+  bool get isEmpty => current == null && sent == null && os == null;
 
   Map<String, dynamic> toJson() => {
         if (current != null) 'current': current!.wireValue,
         if (sent != null) 'sent': sent!.wireValue,
+        if (os != null) 'os': os!.wireValue,
       };
 }
 

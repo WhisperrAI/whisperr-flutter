@@ -5,6 +5,7 @@ analyzer:
     - example/**
     # Its own package: analyzed in its own CI step.
     - packages/**
+    - build/**
   language:
     strict-casts: true
     strict-raw-types: true

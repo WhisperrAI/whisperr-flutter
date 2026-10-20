@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Needs the next `whisperr` release (`>=0.9.0 <0.10.0`).
+- `whisperrPermissionReader(FirebaseMessaging)`: a permission reader for
+  `WhisperrOptions.pushPermissionReader`, from `getNotificationSettings()`.
+- `registerFirebaseMessaging` (with `watchPermission`, the default) sets it
+  as the SDK's reader when none is set, so the SDK keeps the permission
+  current on its own. Its resume check now goes through
+  `refreshPushPermission()`: it reports only when the OS setting changed, so
+  a status set with `setPushPermission` stands until then.
+
 ## 0.2.0
 
 - Works with `whisperr` 0.8.0: the dependency is now `>=0.6.0 <0.9.0`. With

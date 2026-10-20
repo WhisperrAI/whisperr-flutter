@@ -69,7 +69,8 @@ class WhisperrClient {
         _deviceTraits = deviceTraits ?? defaultDeviceTraits,
         _appContextResolver = appContext ?? defaultAppContext,
         _monotonicMs = monotonicMs ?? _stopwatchMs(),
-        _debugBuild = debugBuild ?? kDebugMode;
+        _debugBuild = debugBuild ?? kDebugMode,
+        pushPermissionReader = options.pushPermissionReader;
 
   static int Function() _stopwatchMs() {
     final watch = Stopwatch()..start();
@@ -250,7 +251,9 @@ class WhisperrClient {
 
     _timer = Timer.periodic(_options.flushInterval, (_) => unawaited(_drainQueue()));
 
-    if (_options.flushOnLifecyclePause || _options.trackAutomaticEvents) {
+    if (_options.flushOnLifecyclePause ||
+        _options.trackAutomaticEvents ||
+        _options.automaticPushPermission) {
       try {
         _lifecycle = AppLifecycleListener(onStateChange: handleLifecycleState);
       } catch (_) {
@@ -289,7 +292,21 @@ class WhisperrClient {
       await _trackLaunch(hadPriorState: hadPriorState);
     }
 
+    // Not awaited: a slow permission plugin must not hold up initialize().
+    if (!_launchedInBackground()) {
+      unawaited(_guard(_autoReadPushPermission));
+    }
+
     if (_queue.isNotEmpty) unawaited(_drainQueue());
+  }
+
+  /// The process started without UI (for example for a background push):
+  /// the permission is read when the app first resumes.
+  bool _launchedInBackground() {
+    final state = _currentLifecycleState();
+    return state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached;
   }
 
   /// Applies an app-lifecycle transition. Called by the SDK's own
@@ -299,6 +316,9 @@ class WhisperrClient {
   ///   (with `foreground_ms`), then flushes.
   /// - resumed after a background visit: sends `app_opened` with
   ///   `cold_start: false` (or `true` if the process started in background).
+  /// - resumed (also after a system dialog such as the permission prompt):
+  ///   reads the notification permission when
+  ///   [WhisperrOptions.automaticPushPermission] is on and a reader is set.
   /// - detached: flushes.
   @visibleForTesting
   void handleLifecycleState(AppLifecycleState state) {
@@ -308,6 +328,7 @@ class WhisperrClient {
         unawaited(_guard(_enterBackground));
       case AppLifecycleState.resumed:
         unawaited(_guard(_enterForeground));
+        unawaited(_guard(_autoReadPushPermission));
       case AppLifecycleState.detached:
         if (_options.flushOnLifecyclePause) unawaited(_drainQueue());
       case AppLifecycleState.inactive:
@@ -698,6 +719,69 @@ class WhisperrClient {
   Future<void> setPushPermission(WhisperrPushPermission status) =>
       _mutateIdentity(() => _setPushPermission(status));
 
+  /// The notification permission last reported on this device (through
+  /// [setPushPermission] or an automatic read), or null. It survives
+  /// restarts and [reset].
+  WhisperrPushPermission? get pushPermission => _permission.current;
+
+  /// Reads the OS notification permission for automatic reporting
+  /// ([WhisperrOptions.automaticPushPermission]). Defaults to
+  /// [WhisperrOptions.pushPermissionReader]; `registerFirebaseMessaging`
+  /// sets it when none is set.
+  WhisperrPushPermissionReader? pushPermissionReader;
+
+  /// Reads the OS notification permission with [pushPermissionReader] (no
+  /// prompt) and reports it. Call it right after your own permission prompt
+  /// resolves; the SDK already reads it after start and on each resume.
+  ///
+  /// Like the automatic reads, it reports only when the OS answer differs
+  /// from the last read, or when nothing was sent yet, so a value set with
+  /// [setPushPermission] stands until the OS setting changes. Returns the
+  /// status read, or null without a reader, while opted out, or when the
+  /// reader fails. Works with [WhisperrOptions.automaticPushPermission] off.
+  /// Never throws.
+  Future<WhisperrPushPermission?> refreshPushPermission() async {
+    try {
+      return await _readPushPermission();
+    } catch (e) {
+      _log('push permission read failed ($e)');
+      return null;
+    }
+  }
+
+  Future<void> _autoReadPushPermission() async {
+    if (!_options.automaticPushPermission) return;
+    await _readPushPermission();
+  }
+
+  /// Reads the permission and reports it when the OS answer changed since
+  /// the last read, or when nothing was sent since install or reset().
+  Future<WhisperrPushPermission?> _readPushPermission() async {
+    final reader = pushPermissionReader;
+    if (!_started || _closed || _optedOut || reader == null) return null;
+    final WhisperrPushPermission? read;
+    try {
+      read = await reader();
+    } catch (e) {
+      _log('push permission read failed ($e)');
+      return null;
+    }
+    if (read == null) return null;
+    final status = read;
+    var reported = false;
+    await _mutateIdentity(() async {
+      if (_closed || _optedOut) return;
+      if (_permission.os != status || _permission.sent == null) {
+        await _setPushPermission(status);
+      }
+      _permission = WhisperrPermissionRecord(
+          current: _permission.current, sent: _permission.sent, os: status);
+      await _persistPermission();
+      reported = true;
+    });
+    return reported ? status : null;
+  }
+
   Future<void> _setPushPermission(WhisperrPushPermission status) async {
     _ensureUsable();
     final sent = _permission.sent;
@@ -708,8 +792,8 @@ class WhisperrClient {
         if (sent != null) 'previous_status': sent.wireValue,
       });
     }
-    _permission =
-        WhisperrPermissionRecord(current: status, sent: report ? status : sent);
+    _permission = WhisperrPermissionRecord(
+        current: status, sent: report ? status : sent, os: _permission.os);
     await _persistPermission();
     if (report) unawaited(_drainQueue());
 
@@ -1280,7 +1364,8 @@ class WhisperrClient {
     _currentUserId = null;
     _clearPushPair();
     // The device permission stays; the next report sends it again.
-    _permission = WhisperrPermissionRecord(current: _permission.current);
+    _permission = WhisperrPermissionRecord(
+        current: _permission.current, os: _permission.os);
     _anonymousId = null;
     await _persistIdentity();
     await _persistPushState();
