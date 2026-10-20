@@ -11,7 +11,20 @@
 /// ```
 ///
 /// `registerFirebaseMessaging` also reports Whisperr pushes that arrive while
-/// the app is in the foreground (`push_received`).
+/// the app is in the foreground (`push_received`), and sets the reader the
+/// SDK uses to keep the notification permission current on its own.
+///
+/// To have the permission read from the first launch on, before
+/// `registerFirebaseMessaging` runs, pass the reader to `initialize`:
+///
+/// ```dart
+/// await Whisperr.initialize(
+///   apiKey: 'wpk_...',
+///   options: WhisperrOptions(
+///     pushPermissionReader: whisperrPermissionReader(FirebaseMessaging.instance),
+///   ),
+/// );
+/// ```
 library whisperr_firebase_messaging;
 
 import 'dart:async';
@@ -36,6 +49,24 @@ WhisperrPushPermission whisperrPermissionFrom(AuthorizationStatus status) {
     default:
       return WhisperrPushPermission.undetermined;
   }
+}
+
+/// A [WhisperrPushPermissionReader] that reads the notification permission
+/// from [messaging] (`getNotificationSettings()`, no prompt). On Android it
+/// follows the app's notification switch, which on Android 13+ includes the
+/// `POST_NOTIFICATIONS` permission. Pass it as
+/// `WhisperrOptions.pushPermissionReader`; `registerFirebaseMessaging` sets it
+/// when the client has none. Returns null when Firebase cannot tell.
+WhisperrPushPermissionReader whisperrPermissionReader(
+    FirebaseMessaging messaging) {
+  return () async {
+    try {
+      final settings = await messaging.getNotificationSettings();
+      return whisperrPermissionFrom(settings.authorizationStatus);
+    } catch (_) {
+      return null;
+    }
+  };
 }
 
 /// The result of [WhisperrFirebaseMessaging.registerFirebaseMessaging]. Keep
@@ -94,6 +125,11 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
   ///   App Store or TestFlight builds. It is never guessed; without it the
   ///   token goes without `push_env` (and a debug log says so).
   /// - [watchPermission]: re-check the permission on resume. Default true.
+  ///   It also sets [WhisperrClient.pushPermissionReader] (when none is set),
+  ///   so the SDK reads the permission after each start and resume on its
+  ///   own (`WhisperrOptions.automaticPushPermission`). A resume reports the
+  ///   permission only when the OS setting changed, so a value the app set
+  ///   with `setPushPermission` stands until then.
   /// - [trackForegroundReceipts]: report foreground Whisperr pushes as
   ///   `push_received`. Default true. Background receipts are not reported:
   ///   `FirebaseMessaging.onBackgroundMessage` runs in a separate isolate
@@ -169,13 +205,14 @@ extension WhisperrFirebaseMessaging on WhisperrClient {
 
     AppLifecycleListener? lifecycle;
     if (watchPermission) {
+      pushPermissionReader ??= whisperrPermissionReader(messaging);
       try {
         lifecycle = AppLifecycleListener(onResume: () {
           unawaited(() async {
             try {
-              final settings = await messaging.getNotificationSettings();
-              current = whisperrPermissionFrom(settings.authorizationStatus);
-              await setPushPermission(current);
+              // Reported only when the OS setting changed (see
+              // refreshPushPermission); null while opted out.
+              current = await refreshPushPermission() ?? current;
               // Turned on in Settings: a device that never had a token gets
               // one now. A known token comes back through the SDK on its own.
               if (current.allowsPush && token == null) await fetchToken();

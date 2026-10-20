@@ -444,4 +444,66 @@ void main() {
       expect(again, isEmpty);
     });
   });
+
+  group('automatic permission reader', () {
+    test('whisperrPermissionReader reads the settings without a prompt',
+        () async {
+      final messaging = _FakeMessaging()
+        ..status = AuthorizationStatus.provisional;
+      final read = whisperrPermissionReader(messaging);
+      expect(await read(), WhisperrPushPermission.provisional);
+      messaging.status = AuthorizationStatus.denied;
+      expect(await read(), WhisperrPushPermission.denied);
+      expect(messaging.requests, isEmpty);
+    });
+
+    test('registerFirebaseMessaging sets the reader unless one is set',
+        () async {
+      final h = _Harness();
+      final client = await h.start();
+      expect(client.pushPermissionReader, isNull);
+      final reg = await client.registerFirebaseMessaging(_FakeMessaging());
+      addTearDown(reg.cancel);
+      expect(client.pushPermissionReader, isNotNull);
+
+      Future<WhisperrPushPermission?> own() async => null;
+      final other = await _Harness().start();
+      other.pushPermissionReader = own;
+      final reg2 = await other.registerFirebaseMessaging(_FakeMessaging());
+      addTearDown(reg2.cancel);
+      expect(other.pushPermissionReader, same(own));
+
+      final off = await _Harness().start();
+      final reg3 = await off.registerFirebaseMessaging(_FakeMessaging(),
+          watchPermission: false);
+      addTearDown(reg3.cancel);
+      expect(off.pushPermissionReader, isNull);
+    });
+
+    test('a resume does not override setPushPermission while the OS agrees',
+        () async {
+      final h = _Harness();
+      final client = await h.start();
+      final messaging = _FakeMessaging();
+      final reg = await client.registerFirebaseMessaging(messaging);
+      addTearDown(reg.cancel);
+      final binding = TestWidgetsFlutterBinding.instance;
+      Future<void> resume() async {
+        binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+        binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+        await _pump();
+        await client.flush();
+      }
+
+      await resume(); // the SDK learns the OS answer (authorized)
+      await client.setPushPermission(WhisperrPushPermission.denied);
+      await resume();
+      await resume();
+      expect(h.permissionReports, [
+        {'status': 'authorized'},
+        {'status': 'denied', 'previous_status': 'authorized'},
+      ]);
+      expect(client.pushPermission, WhisperrPushPermission.denied);
+    });
+  });
 }

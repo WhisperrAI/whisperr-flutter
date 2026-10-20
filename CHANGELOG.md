@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Automatic notification permission.** With a permission reader
+  (`WhisperrOptions.pushPermissionReader`, or
+  `WhisperrClient.pushPermissionReader`, which
+  `whisperr_firebase_messaging` sets), the SDK reads the OS permission after
+  start, on each resume (also after the iOS prompt and the Android 13+
+  dialog), and on the new `refreshPushPermission()`, and reports it as
+  `push_permission_changed`. A read reports only when the OS answer changed
+  since the last read, or when nothing was sent yet (new install, after
+  `reset()`), so a status set with `setPushPermission` stands until the OS
+  setting changes. Nothing is read while opted out.
+  `WhisperrOptions.automaticPushPermission` (default true) turns the
+  automatic reads off. The package still has no native code.
+- `WhisperrClient.pushPermission`: the last reported permission.
+
 ## 0.8.0
 
 - **Sessions.** Every event carries `context.session_id` (`sess_` plus a

@@ -184,8 +184,39 @@ know:
 
 ### Permission
 
-Report the OS notification permission on every launch and every resume. The
-SDK sends a status only when it changed.
+The SDK reports the OS notification permission itself when it has a way to
+read it. The package has no native code, so you give it a reader:
+`whisperr_firebase_messaging` provides one, and `registerFirebaseMessaging`
+sets it for you. To read it from the first launch on, pass it to
+`initialize`:
+
+```dart
+await Whisperr.initialize(
+  apiKey: const String.fromEnvironment('WHISPERR_KEY'),
+  options: WhisperrOptions(
+    pushPermissionReader: whisperrPermissionReader(FirebaseMessaging.instance),
+  ),
+);
+```
+
+Any `Future<WhisperrPushPermission?> Function()` works, for example one built
+on `permission_handler`. With a reader the SDK reads the permission (no
+prompt):
+
+- after `initialize()` when the app starts in the foreground,
+- each time the app resumes. This also follows the iOS permission prompt and
+  the Android 13+ notification dialog, which pause the app while they show,
+- when you call `await Whisperr.instance.refreshPushPermission()`, for
+  example right after your own prompt.
+
+A read reports only when the OS answer changed since the last read, or when
+nothing was sent yet (a new install, after `reset()`). A status you report
+yourself with `setPushPermission` therefore stands until the OS setting
+changes. Nothing is read while opted out.
+`WhisperrOptions(automaticPushPermission: false)` stops the automatic reads;
+`refreshPushPermission()` and `setPushPermission` still work.
+
+You can always report it yourself:
 
 ```dart
 WhisperrPushPermission toWhisperr(AuthorizationStatus status) =>

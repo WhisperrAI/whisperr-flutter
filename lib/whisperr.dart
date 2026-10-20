@@ -20,4 +20,5 @@ export 'src/persistence.dart'
     show WhisperrPersistence, InMemoryPersistence, SharedPreferencesPersistence;
 export 'src/whisperr_client.dart'
     show Whisperr, WhisperrClient, kWhisperrSdkVersion, kWhisperrDefaultBaseUrl;
-export 'src/whisperr_options.dart' show WhisperrOptions;
+export 'src/whisperr_options.dart'
+    show WhisperrOptions, WhisperrPushPermissionReader;

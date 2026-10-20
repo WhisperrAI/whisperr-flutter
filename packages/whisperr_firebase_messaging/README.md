@@ -58,7 +58,11 @@ What it does:
    token first, because Firebase needs it. Before login the token goes out
    under the device's anonymous id; `identify()` attaches it to the user.
 4. It forwards `onTokenRefresh` and checks the permission again each time the
-   app resumes.
+   app resumes. It also sets the SDK's permission reader
+   (`Whisperr.instance.pushPermissionReader`, when none is set), so the SDK
+   reads the permission on its own after each start and resume. A resume
+   reports only when the OS setting changed, so a status you set with
+   `setPushPermission` stands until then.
 5. It reports Whisperr pushes that arrive in the foreground
    (`FirebaseMessaging.onMessage`) as `push_received`, once per message.
    Background receipts are not reported: `onBackgroundMessage` runs in a
@@ -68,6 +72,22 @@ What it does:
 
 It never throws. Calling it again is safe; Whisperr dedups.
 
+To have the SDK read the permission from the first launch on, before this
+call runs, pass the reader to `initialize`:
+
+```dart
+await Whisperr.initialize(
+  apiKey: const String.fromEnvironment('WHISPERR_KEY'),
+  options: WhisperrOptions(
+    pushPermissionReader: whisperrPermissionReader(FirebaseMessaging.instance),
+  ),
+);
+```
+
+`whisperrPermissionReader` reads `getNotificationSettings()` (no prompt). On
+Android that follows the app's notification switch, which on Android 13+
+includes the `POST_NOTIFICATIONS` permission.
+
 Options:
 
 | Option | Default | What it does |
@@ -76,7 +96,7 @@ Options:
 | `provisional` | `false` | iOS quiet delivery without a prompt. |
 | `useApnsToken` | `false` | On iOS, register the raw APNs token (`kind: apns`) instead of the FCM token. Use it only when Whisperr sends to your app through APNs directly. |
 | `apnsEnvironment` | — | With `useApnsToken`: `sandbox` for development-signed builds, `production` for TestFlight and the App Store. This package has no native code and cannot read the `aps-environment` entitlement, so pass it, for example `kReleaseMode ? WhisperrPushEnvironment.production : WhisperrPushEnvironment.sandbox` when your release builds go to TestFlight or the App Store. Never guessed: without it the token has no `push_env`. |
-| `watchPermission` | `true` | Check the permission again on each resume. |
+| `watchPermission` | `true` | Check the permission again on each resume, and set the SDK's permission reader. |
 | `trackForegroundReceipts` | `true` | Report foreground Whisperr pushes as `push_received`. The core option `trackAutomaticEvents: false` also turns this off. |
 
 ## Notification taps and deep links

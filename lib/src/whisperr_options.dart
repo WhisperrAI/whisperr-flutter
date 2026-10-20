@@ -1,5 +1,11 @@
 import 'models.dart';
 
+/// Reads the OS notification permission without showing a prompt, for
+/// example from `FirebaseMessaging.getNotificationSettings()` or the
+/// `permission_handler` plugin. Returns null when it cannot tell.
+typedef WhisperrPushPermissionReader = Future<WhisperrPushPermission?>
+    Function();
+
 /// Tunable behavior for the Whisperr client.
 class WhisperrOptions {
   const WhisperrOptions({
@@ -17,6 +23,8 @@ class WhisperrOptions {
     this.restoreIdentifyDelay = const Duration(seconds: 3),
     this.captureErrors = true,
     this.launchSourceWindow = const Duration(milliseconds: 1500),
+    this.automaticPushPermission = true,
+    this.pushPermissionReader,
     this.debug = false,
     this.onError,
   })  : assert(flushAt > 0),
@@ -89,6 +97,27 @@ class WhisperrOptions {
   /// push tap resolves it, when the app goes to the background, or on
   /// [WhisperrClient.flush]. [Duration.zero] sends it at once.
   final Duration launchSourceWindow;
+
+  /// Read the OS notification permission with [pushPermissionReader] (or
+  /// the reader set later through [WhisperrClient.pushPermissionReader], as
+  /// `whisperr_firebase_messaging` does) and report it as
+  /// `push_permission_changed`: after start, each time the app resumes
+  /// (which also follows the iOS prompt and the Android 13+ notification
+  /// dialog), and on [WhisperrClient.refreshPushPermission]. An automatic
+  /// read reports only when the OS answer differs from the last automatic
+  /// read, or when nothing was sent yet (a new install, after
+  /// [WhisperrClient.reset]), so a value the app set with
+  /// [WhisperrClient.setPushPermission] stands until the OS setting
+  /// changes. Nothing is read while opted out. Without a reader this does
+  /// nothing: the SDK has no native code. Set to false to report only
+  /// through `setPushPermission`.
+  final bool automaticPushPermission;
+
+  /// Reads the OS notification permission for [automaticPushPermission].
+  /// `whisperr_firebase_messaging` provides one
+  /// (`whisperrPermissionReader(FirebaseMessaging.instance)`), and
+  /// `registerFirebaseMessaging` sets it when none is set.
+  final WhisperrPushPermissionReader? pushPermissionReader;
 
   /// Emit verbose logs via `debugPrint`.
   final bool debug;
