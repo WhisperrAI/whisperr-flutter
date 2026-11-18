@@ -30,6 +30,7 @@ const kV2Sections = [
   'restoreIdentify',
   'appLanguage',
   'anonymousPush',
+  'anonymousReset',
   'pushRegistration',
   'versionContext',
 ];

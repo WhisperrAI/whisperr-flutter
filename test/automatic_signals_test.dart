@@ -263,6 +263,10 @@ void main() {
       final second = h.client(automatic: false);
       await second.start();
       expect(second.anonymousId, anon);
+      // No user: the device is still the same anonymous visitor.
+      await second.reset();
+      expect(second.anonymousId, anon);
+      await second.identify('user_1');
       await second.reset();
       expect(second.anonymousId, isNull);
       await second.track('pricing_viewed');

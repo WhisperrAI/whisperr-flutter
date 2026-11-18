@@ -276,7 +276,12 @@ void main() {
           overrideEnv: 'WHISPERR_V2_SPEC_PATH');
       final s = (spec['sections'] as Map)[section] as Map;
       expect((s['appliesTo'] as List), contains('mobile'));
-      final cases = (s['cases'] as List).cast<Map<String, dynamic>>();
+      // A later section may supersede a case of an earlier one.
+      final superseded = await supersededCases();
+      final cases = (s['cases'] as List)
+          .cast<Map<String, dynamic>>()
+          .where((c) => !superseded.contains('v2.json:${c['name']}'))
+          .toList();
       expect(cases, isNotEmpty);
       for (final raw in cases) {
         final c = _Case(section, raw);

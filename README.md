@@ -258,7 +258,9 @@ Whisperr.instance.track('report_exported', properties: {'format': 'pdf'});
 
 You can call `track()` before `identify()`. The SDK sends the event under a
 device `anonymous_id`. The next `identify()` carries the same id, so Whisperr
-merges those events into the user. `reset()` starts a new anonymous id.
+merges those events into the user. `reset()` after a user starts a new
+anonymous id; `reset()` with no user does nothing, so it is safe to call on
+every signed-out state.
 
 Every event (yours and the automatic ones) carries `app_version`,
 `app_build`, `platform`, `sdk_name` and `sdk_version` in its `context`. A key
