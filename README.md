@@ -6,7 +6,7 @@ Identify your users and track product events so Whisperr can decide and deliver 
 
 ```yaml
 dependencies:
-  whisperr: ^0.8.0
+  whisperr: ^0.8.1
 ```
 
 ## Initialize
