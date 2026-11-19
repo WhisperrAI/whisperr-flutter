@@ -3,7 +3,7 @@
 ///
 /// To test against an unmerged spec branch, set it here and as `ref:` in
 /// ci.yml.
-const String kSpecRef = 'fix/reset-without-user-keeps-handle';
+const String kSpecRef = 'main';
 
 /// Base URL of the conformance fixtures at [kSpecRef].
 const String kSpecBaseUrl =
