@@ -16,7 +16,7 @@ import 'signals.dart';
 import 'whisperr_options.dart';
 
 /// Current SDK version. Kept in sync with pubspec.yaml.
-const String kWhisperrSdkVersion = '0.8.0';
+const String kWhisperrSdkVersion = '0.8.1';
 
 /// Default Whisperr runtime API origin. Override only for self-hosted or local
 /// development backends.
@@ -1266,10 +1266,24 @@ class WhisperrClient {
   /// Set [flushBeforeReset] to false for interactive logout: clear identity
   /// locally while queued operations retain their original user and drain in
   /// the background. An offline transport cannot delay the next login.
+  ///
+  /// Without a current user it does nothing: the device is still the same
+  /// anonymous visitor, so the [anonymousId], the sent push permission and
+  /// the push token stay (SPEC.md -> Anonymous visitors). Safe to call on
+  /// every signed-out state.
   Future<void> reset({bool flushBeforeReset = true}) =>
       _mutateIdentity(() => _reset(flushBeforeReset: flushBeforeReset));
 
   Future<void> _reset({required bool flushBeforeReset}) async {
+    // Nobody to log out. Rotating here would mint a new anonymous user per
+    // call, each with a fresh push_permission_changed, and identify() promotes
+    // only the last handle, so the others would stay orphaned. Before start()
+    // the stored user is not known yet, so reset as before.
+    final restoring = _restoring;
+    if (restoring != null) {
+      await restoring;
+      if (_currentUserId == null) return;
+    }
     if (flushBeforeReset) await flush();
     _restoreTimer?.cancel();
     _restoreTimer = null;

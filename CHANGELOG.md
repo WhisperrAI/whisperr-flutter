@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1
+
+- **`reset()` with no signed-in user is a no-op.** Before, each call rotated
+  the anonymous id and forgot the reported push permission, so an app that
+  calls `reset()` on every signed-out state created a new anonymous user (with
+  a repeated `push_permission_changed`) per call, and `identify()` promoted
+  only the last one. The anonymous id, the reported permission and the push
+  token now stay. `reset()` after `identify()` (or with a user restored at
+  start) still logs out as before. It is safe to call `reset()` on every
+  signed-out state.
+
 ## 0.8.0
 
 - **Sessions.** Every event carries `context.session_id` (`sess_` plus a

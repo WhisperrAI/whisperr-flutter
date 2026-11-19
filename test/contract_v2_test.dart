@@ -451,24 +451,17 @@ void main() {
       expect(h.identifies, hasLength(2));
     });
 
-    test('reset while anonymous moves the token to the new handle', () async {
+    test('reset while anonymous keeps the token under the handle', () async {
       final h = _Harness();
       final c = await h.start();
       await c.setPushToken('tok_a');
       final before = c.anonymousId;
       await c.reset();
       await c.flush();
-      final after = c.anonymousId;
-      expect(after, isNot(before));
-      expect(h.identifies.skip(1).toList(), [
+      expect(c.anonymousId, before);
+      expect(h.identifies, [
         {
           'anonymous_id': before,
-          'channels': [
-            {'channel': 'push', 'address': 'tok_a', 'opted_in': false}
-          ],
-        },
-        {
-          'anonymous_id': after,
           'channels': [_push('tok_a')],
         },
       ]);

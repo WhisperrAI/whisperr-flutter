@@ -382,6 +382,64 @@ void main() {
       expect(h.identifies.where((b) => b.containsKey('channels')), isEmpty);
     });
 
+    test(
+        'reset without a user keeps the handle and the sent status, so '
+        'identify promotes the one handle', () async {
+      // An app that calls reset() on every signed-out state and reports the
+      // permission after it: before the fix every call minted a handle and a
+      // fresh report, and identify() promoted only the last one.
+      final h = _Harness();
+      final c = await h.start();
+      for (var i = 0; i < 3; i++) {
+        await c.setPushPermission(WhisperrPushPermission.denied);
+        await c.reset();
+      }
+      final handle = c.anonymousId;
+      expect(handle, isNotNull);
+      await c.identify('user_1');
+      await c.flush();
+      expect(h.permissionEvents, [
+        {
+          'properties': {..._common, 'status': 'denied'},
+        },
+      ]);
+      expect(h.events.single['anonymous_id'], handle);
+      expect(h.identifies.single,
+          {'external_user_id': 'user_1', 'anonymous_id': handle});
+    });
+
+    test('reset after identify rotates once; a second reset keeps the handle',
+        () async {
+      final h = _Harness();
+      final c = await h.start();
+      await c.setPushPermission(WhisperrPushPermission.denied);
+      final first = c.anonymousId;
+      await c.identify('user_1');
+      await c.reset();
+      await c.setPushPermission(WhisperrPushPermission.denied);
+      final second = c.anonymousId;
+      await c.reset();
+      await c.setPushPermission(WhisperrPushPermission.denied);
+      await c.flush();
+      expect(second, isNot(first));
+      expect(c.anonymousId, second);
+      expect(h.events.map((e) => e['anonymous_id']), [first, second]);
+    });
+
+    test('reset after a restart with a stored user still logs out', () async {
+      final h = _Harness()..persistence = _SlowLoads();
+      await h.persistence.save(
+          WhisperrPersistence.identitySlot, jsonEncode({'user_id': 'user_1'}));
+      await h.persistence.save(WhisperrPersistence.anonymousSlot, 'anon_old');
+      final c = h.build();
+      final started = c.start();
+      final reset = c.reset(); // before the restore resolves
+      await started;
+      await reset;
+      expect(c.currentUserId, isNull);
+      expect(c.anonymousId, isNot('anon_old'));
+    });
+
     test('a 0.5.x record sends the event once and keeps its denied gate',
         () async {
       final h = _Harness();
